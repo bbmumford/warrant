@@ -1,15 +1,20 @@
-// Package warrant is the scope-agnostic authority core for the ORBTR platform
-// retirement (plan §16.1). Like loom it interprets NO axis itself: meaning is supplied
-// by the consumer via a CapabilityPolicy. But the CORE — never the consumer — enforces
-// every authority invariant, and provenance is UNFORGEABLE from outside the module by
-// construction (VerifiedPrincipal + Mint live in internal/mint; see that package).
+// Package warrant is the scope-agnostic, receiver-pinned authority core for the ORBTR
+// platform retirement (plan §16.1). Like loom it interprets NO axis itself; but the CORE —
+// never a consumer — enforces every authority invariant, and authority is RECEIVER-
+// VERIFIABLE at runtime, independent of caller-selected import path.
 //
-// v3 closes risk R-2399's six gaps: (1) internal/mint boundary makes forgery a compile
-// error for external modules; (2) the owner is a SEALED claim read by key from the
-// verified principal, never a raw policy string; (3) Authorize binds partition realm ==
-// capability realm and forbids a global-route owner; (4) principal validity is checked;
-// (5) a concrete receiver-local TrustEvaluator gates foreign-realm grants; (6) realm and
-// capability grammar is canonically validated. Every leg has an executable hostile.
+// The model (R-2407/R-2411): a trusted host builds ONE Verifier (a per-instance secret from
+// crypto/rand) at boot and shares it between its authentication edge (which Mints principals
+// from real auth) and its Authorizer (which Verifies). A forger — even a nested-path module
+// that imports internal/mint — can mint, but stamps its OWN secret, and the real Authorizer
+// denies it. The Authorizer is constructed once with pinned trust, an immutable route table
+// keyed by server operation identity, its own clock, and replay state; Authorize accepts NO
+// caller-supplied clock, nonce, trust, capability, or route authority.
+//
+// THREAT-MODEL SCOPE: this defeats path-based forgery, public-API injection, and caller-
+// supplied-authority. It does NOT defend against a same-process module using unsafe/reflect
+// to read the secret from memory — a fundamental Go limitation, explicitly out of scope;
+// warrant's consumers are first-party endpoint code.
 package warrant
 
 import (
@@ -17,71 +22,52 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bbmumford/warrant/internal/mint"
 )
 
-// ErrDenied is the SINGLE non-disclosing deny. Every failure — forged/unverified
-// principal, nil policy, invalid route, absent/foreign owner, realm mismatch, unmet
-// capability, untrusted foreign realm, malformed input, policy error — surfaces as this,
-// so a refusal never discloses which leg failed (#R-896).
+// ErrDenied is the SINGLE non-disclosing deny. Every failure — forged/unverified seal, wrong
+// platform tenant, unknown operation, untrusted/expired assertion, realm mismatch, absent or
+// mismatched owner, unmet capability, replayed nonce, nil seam, malformed grammar — surfaces
+// as this, so a refusal never discloses which leg failed.
 var ErrDenied = errors.New("authorization denied")
 
-// VerifiedPrincipal and Subject are re-exported from internal/mint by ALIAS: the type is
-// usable here and by consumers, but Mint (which sets verified=true) is reachable ONLY
-// from within this module. An external module can construct a zero-value VerifiedPrincipal
-// (verified=false → denied) and nothing more.
+// Re-exported from internal/mint. The types are usable by consumers; Mint (a Verifier method)
+// and the seal live in internal/mint, and the seal has no accessor, so no consumer can read
+// or forge a valid seal through this API.
 type (
 	VerifiedPrincipal = mint.VerifiedPrincipal
 	Subject           = mint.Subject
 	SubjectKind       = mint.SubjectKind
+	Assertion         = mint.Assertion
+	Verifier          = mint.Verifier
 )
+
+// NewVerifier builds the receiver-pinned Verifier. The trusted host calls this ONCE at boot
+// and shares the returned *Verifier between its edge (Mint) and its Authorizer (NewAuthorizer).
+func NewVerifier() (*Verifier, error) { return mint.NewVerifier() }
 
 const maxTokenLen = 64
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OwnerScope — server-established {realm, owner}. No exported constructor: minted only
-// inside Authorize from the SEALED claim, so a handler can only RECEIVE one, never
-// fabricate one from a body value.
+// Canonical grammar. realm may contain "." (an RPC-namespace root, e.g. orbtr.ai) but never
+// a leading/trailing/double dot; resource/action are single dotless segments; action may be
+// a terminal "*".
 // ─────────────────────────────────────────────────────────────────────────────
 
-type OwnerScope struct {
-	realm string
-	owner string
-}
-
-func newOwnerScope(realm, owner string) OwnerScope { return OwnerScope{realm: realm, owner: owner} }
-
-func (o OwnerScope) Realm() string { return o.realm }
-func (o OwnerScope) Owner() string { return o.owner }
-
-// IsZero denies unless BOTH realm and owner are non-empty (R-2399 #4: a partial scope is
-// not a partition).
-func (o OwnerScope) IsZero() bool { return o.realm == "" || o.owner == "" }
-
-// Equal is the collision-safe partition comparison (field-wise, not string concat).
-func (o OwnerScope) Equal(x OwnerScope) bool { return o.realm == x.realm && o.owner == x.owner }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// (R-2399 #6) Canonical grammar. realm may contain "." (an RPC-namespace root, e.g.
-// orbtr.ai) but never a leading/trailing/double dot; resource/action are single
-// segments with no dots; action may be a terminal "*".
-// ─────────────────────────────────────────────────────────────────────────────
-
-// validRealm: dotted lower token, no empty label (rejects "", ".", ".x", "x.", "x..y").
 func validRealm(s string) bool {
 	if s == "" || len(s) > maxTokenLen {
 		return false
 	}
 	for _, label := range strings.Split(s, ".") {
-		if !validSegment(label, false) { // each dotted label is a plain segment
+		if !validSegment(label, false) {
 			return false
 		}
 	}
 	return true
 }
 
-// validSegment: non-empty lower alnum + _ - ; optionally the terminal "*".
 func validSegment(s string, allowWildcard bool) bool {
 	if allowWildcard && s == "*" {
 		return true
@@ -97,11 +83,10 @@ func validSegment(s string, allowWildcard bool) bool {
 	return true
 }
 
-// validOwner: an owner key is a single non-empty segment (no dots).
 func validOwner(s string) bool { return validSegment(s, false) }
 
-// Capability is realm-namespaced: "<realm>:<resource>.<action>". Unexported fields;
-// only ParseCapability mints a valid one.
+// Capability is realm-namespaced: "<realm>:<resource>.<action>". Unexported fields; only
+// ParseCapability mints a valid one.
 type Capability struct{ realm, resource, action string }
 
 func ParseCapability(s string) (Capability, error) {
@@ -122,16 +107,13 @@ func ParseCapability(s string) (Capability, error) {
 func (c Capability) Realm() string { return c.realm }
 func (c Capability) IsZero() bool  { return c.realm == "" }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CapabilitySet — concrete, same-realm subsumption only, empty denies.
-// ─────────────────────────────────────────────────────────────────────────────
-
+// CapabilitySet — same-realm subsumption only; a terminal "*" action subsumes any action in
+// the same realm+resource; cross-realm never subsumes; empty denies. This is where cross-
+// realm requests fail: a route requiring orbtr.io:* is never met by an orbtr.ai capability.
 type CapabilitySet struct{ held []Capability }
 
 func NewCapabilitySet(held ...Capability) CapabilitySet { return CapabilitySet{held: held} }
 
-// Allows: same-realm only; a held terminal "*" action subsumes any action in the same
-// realm+resource. Cross-realm never subsumes. An empty/zero required denies.
 func (s CapabilitySet) Allows(required Capability) bool {
 	if required.IsZero() {
 		return false
@@ -147,7 +129,6 @@ func (s CapabilitySet) Allows(required Capability) bool {
 	return false
 }
 
-// Subsumes: the first-class child clamp — every capability other holds, this holds.
 func (s CapabilitySet) Subsumes(other CapabilitySet) bool {
 	for _, o := range other.held {
 		if !s.Allows(o) {
@@ -157,22 +138,34 @@ func (s CapabilitySet) Subsumes(other CapabilitySet) bool {
 	return true
 }
 
-// realms returns the distinct realms of the held capabilities (for trust gating).
-func (s CapabilitySet) realms() []string {
-	seen := map[string]struct{}{}
-	var out []string
-	for _, h := range s.held {
-		if _, ok := seen[h.realm]; !ok {
-			seen[h.realm] = struct{}{}
-			out = append(out, h.realm)
-		}
-	}
-	return out
+// ─────────────────────────────────────────────────────────────────────────────
+// OwnerScope — server-established {realm, owner}. No exported constructor: minted only
+// inside Authorize from the SEALED owner, so a handler can only RECEIVE one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type OwnerScope struct {
+	realm string
+	owner string
 }
 
+func newOwnerScope(realm, owner string) OwnerScope { return OwnerScope{realm: realm, owner: owner} }
+
+func (o OwnerScope) Realm() string { return o.realm }
+func (o OwnerScope) Owner() string { return o.owner }
+
+// IsZero denies unless BOTH realm and owner are non-empty (a partial scope is not a partition).
+func (o OwnerScope) IsZero() bool { return o.realm == "" || o.owner == "" }
+
+func (o OwnerScope) Equal(x OwnerScope) bool { return o.realm == x.realm && o.owner == x.owner }
+
 // ─────────────────────────────────────────────────────────────────────────────
-// (R-2399 #3) Route — closed sum; no contradictory flags.
+// Route — closed sum, keyed by SERVER operation identity (R-2411 pin 2). The Authorizer
+// holds an immutable route table; a caller supplies only the operation being invoked (set
+// server-side by the RPC dispatch), never a substituted weaker route.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// OperationID names a server operation (an RPC method), not a caller-chosen route.
+type OperationID string
 
 type routeMode int
 
@@ -180,83 +173,38 @@ const (
 	modeInvalid routeMode = iota
 	modeOwnerBound
 	modeGlobal
-	modeExplicitNone
 )
 
 type Route struct {
+	op       OperationID
 	mode     routeMode
 	required Capability
 }
 
-// OwnerBoundRoute: a per-owner op; requires a valid capability; the resolved OwnerScope
-// binds every selector, and its realm must equal the capability's realm.
-func OwnerBoundRoute(required Capability) (Route, error) {
-	if required.IsZero() {
+// OwnerBoundRoute: a per-owner op; the resolved OwnerScope's realm equals the capability's
+// realm, and the sealed owner must equal the op's body owner.
+func OwnerBoundRoute(op OperationID, required Capability) (Route, error) {
+	if op == "" || required.IsZero() {
 		return Route{}, ErrDenied
 	}
-	return Route{mode: modeOwnerBound, required: required}, nil
+	return Route{op: op, mode: modeOwnerBound, required: required}, nil
 }
 
-// GlobalRoute: a genuinely owner-less op; requires its explicit capability; rejects any
-// per-owner/body binding.
-func GlobalRoute(required Capability) (Route, error) {
-	if required.IsZero() {
+// GlobalRoute: a genuinely owner-less op; rejects any owner-bearing principal.
+func GlobalRoute(op OperationID, required Capability) (Route, error) {
+	if op == "" || required.IsZero() {
 		return Route{}, ErrDenied
 	}
-	return Route{mode: modeGlobal, required: required}, nil
-}
-
-// ExplicitNoneRoute: a deliberate enforcement opt-out (token-as-authority routes keep
-// their own mandatory handler gate).
-func ExplicitNoneRoute() Route { return Route{mode: modeExplicitNone} }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// (R-2399 #2) Consumer policy — returns a sealed claim KEY, never a raw owner string.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ClaimKey is a member of the CLOSED owner-claim vocabulary. A policy names WHICH sealed
-// claim carries the owner; the core reads it from the verified principal. A policy can
-// never hand back a raw (potentially body-derived) owner string.
-type ClaimKey string
-
-const (
-	ClaimOrg  ClaimKey = "org"
-	ClaimUser ClaimKey = "user"
-)
-
-func (k ClaimKey) valid() bool { return k == ClaimOrg || k == ClaimUser }
-
-// Resolution is what a CapabilityPolicy returns — ROUTING only, never grants. Realm is
-// the consumer's own realm (a canonical constant it operates). OwnerKey names the sealed
-// claim the owner is read from (empty for a Global route). The effective CAPABILITIES are
-// NOT here: they are sealed into the VerifiedPrincipal at mint, so a policy cannot inject
-// them (R-2405 #1).
-type Resolution struct {
-	Realm    string
-	OwnerKey ClaimKey
-}
-
-// CapabilityPolicy is the CONSUMER-SUPPLIED routing interpretation — warrant ships none.
-// It reads only the VerifiedPrincipal (never a request body), returns a Resolution
-// (routing), and CANNOT author capabilities or the owner. It does not enforce invariants
-// or do the body compare — those are the Authorizer's job.
-type CapabilityPolicy interface {
-	Resolve(ctx context.Context, principal VerifiedPrincipal, route Route) (Resolution, error)
-}
-
-// Identity is what a handler receives from Authorize.
-type Identity struct {
-	Subject      Subject
-	OwnerScope   OwnerScope // zero for a Global route
-	Capabilities CapabilitySet
+	return Route{op: op, mode: modeGlobal, required: required}, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (R-2405 #2/#3) Receiver-local realm trust — a CONCRETE owner-ratified store, not an
-// external interface; entries are validated at construction; replay is real state.
+// Receiver-pinned trust (R-2411 pins 1/3). RealmTrust entries are owner-ratified, validated
+// at construction, and consumed by the Authorizer's own clock — never a caller interface.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// RealmTrust is an owner-ratified receiver-local trust entry for a foreign realm.
+// RealmTrust is an owner-ratified receiver-local trust entry. The home realm has one too;
+// foreign realms add theirs. Audience is the receiver this realm issues tokens for.
 type RealmTrust struct {
 	Realm         string
 	Issuer        string
@@ -270,82 +218,148 @@ func (rt RealmTrust) valid() bool {
 	return validRealm(rt.Realm) && rt.Issuer != "" && rt.Audience != "" && rt.PolicyVersion != "" && rt.ExpiresAtMS > 0
 }
 
-// trustStore is concrete (not an interface a caller can make always-true). It holds
-// owner-ratified entries + real replay state (consumed nonces).
-type trustStore struct {
-	home     string
-	entries  map[string]RealmTrust
+// Clock returns the current time in unix-milliseconds. The Authorizer owns one; Authorize
+// accepts no caller-supplied time (R-2411 pin 3).
+type Clock func() int64
+
+// replayStore holds consumed assertion identities. consume is atomic: two concurrent
+// identical uses yield exactly ONE first-use success.
+type replayStore struct {
 	mu       sync.Mutex
-	seen     map[string]struct{} // consumed replay nonces (real state, not a static bool)
-	audience string              // this receiver's expected audience
+	consumed map[string]struct{}
 }
 
-// trusts reports whether realm is trusted right now. Home realm is always trusted. A
-// foreign realm needs a live, unrevoked, unexpired, audience-matching entry, and — when
-// the assertion carries a nonce — that nonce must be first-use (consumed here).
-func (t *trustStore) trusts(realm string, nowMS int64, nonce string) bool {
-	if realm == t.home {
-		return true
+func newReplayStore() *replayStore { return &replayStore{consumed: map[string]struct{}{}} }
+
+func (r *replayStore) consume(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, used := r.consumed[key]; used {
+		return false
 	}
-	e, ok := t.entries[realm]
-	if !ok || e.Revoked || e.ExpiresAtMS <= nowMS || e.Audience != t.audience {
-		return false // fail closed: absent, revoked, expired, wrong audience
-	}
-	if nonce != "" { // replay: first use succeeds, an identical second use is denied
-		t.mu.Lock()
-		defer t.mu.Unlock()
-		if _, used := t.seen[nonce]; used {
-			return false
-		}
-		t.seen[nonce] = struct{}{}
-	}
+	r.consumed[key] = struct{}{}
 	return true
 }
 
-// Authorizer binds the receiver-local configuration — expected platform tenant, home
-// realm, audience, and owner-ratified trust — at construction. All of it is validated;
-// there is no external-implementable trust hook. This is the ONE enforcement seam.
-type Authorizer struct {
-	expectedPlatformTenant string
-	home                   string
-	trust                  *trustStore
+// Identity is what a handler receives from a successful Authorize.
+type Identity struct {
+	Subject      Subject
+	OwnerScope   OwnerScope // zero for a Global route
+	Capabilities CapabilitySet
 }
 
-// NewAuthorizer validates the receiver config + every trust entry (R-2405 #2/#4). It
-// fails if the platform tenant or home realm is empty/non-canonical or any entry is
-// invalid — owner-ratified config, checked, not caller-trusted at use time.
-func NewAuthorizer(expectedPlatformTenant, homeRealm, audience string, entries ...RealmTrust) (*Authorizer, error) {
-	if expectedPlatformTenant == "" || !validRealm(homeRealm) || audience == "" {
+// Authorizer is the ONE enforcement seam. It is constructed once by the trusted host with a
+// paired Verifier, the expected platform tenant, pinned trust (home + foreign), an immutable
+// route table, and a clock. Handlers receive it and call Authorize; they cannot construct or
+// select it, nor supply a route, clock, nonce, trust, or capability.
+type Authorizer struct {
+	verifier       *mint.Verifier
+	expectedTenant string
+	audience       string
+	trust          map[string]RealmTrust
+	routes         map[OperationID]Route
+	clock          Clock
+	replay         *replayStore
+}
+
+// NewAuthorizer validates the receiver config, every trust entry, and every route at
+// construction (fail-closed): nil verifier, empty tenant, invalid home trust, an invalid or
+// audience-mismatched or home-colliding or duplicate foreign entry, or an invalid/duplicate
+// route all reject. A nil clock defaults to real wall time.
+func NewAuthorizer(verifier *Verifier, expectedTenant string, clock Clock, routes []Route, home RealmTrust, foreign ...RealmTrust) (*Authorizer, error) {
+	if verifier == nil || expectedTenant == "" || !home.valid() {
 		return nil, ErrDenied
 	}
-	m := make(map[string]RealmTrust, len(entries))
-	for _, e := range entries {
-		if !e.valid() || e.Realm == homeRealm {
+	trust := map[string]RealmTrust{home.Realm: home}
+	for _, e := range foreign {
+		if !e.valid() || e.Realm == home.Realm || e.Audience != home.Audience {
 			return nil, ErrDenied
 		}
-		m[e.Realm] = e
+		if _, dup := trust[e.Realm]; dup {
+			return nil, ErrDenied
+		}
+		trust[e.Realm] = e
+	}
+	rm := make(map[OperationID]Route, len(routes))
+	for _, r := range routes {
+		if r.op == "" || r.mode == modeInvalid || r.required.IsZero() {
+			return nil, ErrDenied
+		}
+		if _, dup := rm[r.op]; dup {
+			return nil, ErrDenied
+		}
+		rm[r.op] = r
+	}
+	if clock == nil {
+		clock = func() int64 { return time.Now().UnixMilli() }
 	}
 	return &Authorizer{
-		expectedPlatformTenant: expectedPlatformTenant,
-		home:                   homeRealm,
-		trust:                  &trustStore{home: homeRealm, entries: m, seen: map[string]struct{}{}, audience: audience},
+		verifier:       verifier,
+		expectedTenant: expectedTenant,
+		audience:       home.Audience,
+		trust:          trust,
+		routes:         rm,
+		clock:          clock,
+		replay:         newReplayStore(),
 	}, nil
 }
 
-// Authorize resolves the server-established Identity and enforces every invariant in the
-// core. bodyOwner is the op-specific owner field (compare-only). nonce is an optional
-// replay nonce for a presented trust assertion. Non-disclosing: every failure is ErrDenied.
-func (a *Authorizer) Authorize(ctx context.Context, policy CapabilityPolicy, principal VerifiedPrincipal, route Route, bodyOwner string, nowMS int64, nonce string) (Identity, error) {
-	if a == nil || policy == nil || route.mode == modeInvalid {
+// trustAccepts verifies the principal's sealed assertion against pinned trust and the
+// Authorizer's OWN clock: the principal's realm must have a live (unrevoked, unexpired) trust
+// entry whose issuer/audience/version match the sealed assertion, the token must not be
+// expired, and its audience must be this receiver's.
+func (a *Authorizer) trustAccepts(p VerifiedPrincipal) bool {
+	realm := p.Realm()
+	if !validRealm(realm) {
+		return false
+	}
+	e, ok := a.trust[realm]
+	if !ok {
+		return false
+	}
+	now := a.clock()
+	if e.Revoked || e.ExpiresAtMS <= now {
+		return false
+	}
+	if p.ExpiresAtMS() <= 0 || now >= p.ExpiresAtMS() {
+		return false
+	}
+	if p.Audience() != a.audience {
+		return false
+	}
+	return e.Issuer == p.Issuer() && e.Audience == p.Audience() && e.PolicyVersion == p.Version()
+}
+
+// Authorize enforces every invariant, in order: (1) seal verified against the receiver's own
+// secret, constant-time; (2) subject validity + platform-tenant admission; (3) immutable
+// server-operation route lookup; (4) sealed assertion trust + expiry against the owned clock;
+// (5) sealed capabilities parsed + owner/realm/capability binding; (6) atomic replay consume
+// LAST, only after every prior check passes, so a failed attempt cannot poison a nonce.
+// Non-disclosing: every failure is ErrDenied. bodyOwner is the op-specific owner (compare-only).
+func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal, op OperationID, bodyOwner string) (Identity, error) {
+	_ = ctx
+	// nil-seam fail-closed.
+	if a == nil || a.verifier == nil || a.replay == nil || a.clock == nil {
 		return Identity{}, ErrDenied
 	}
-	// (#4) principal validity + admission: verified, non-empty subject, and the platform
-	// tenant must be the receiver's EXPECTED tenant (a foreign non-empty value is denied).
-	if !principal.Verified() || principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.PlatformTenant() != a.expectedPlatformTenant {
+	// (1) receiver-pinned seal — a principal minted by any other Verifier is denied.
+	if !a.verifier.Verify(principal) {
 		return Identity{}, ErrDenied
 	}
-	// (#1) effective capabilities come from the SEALED principal, parsed here — never from
-	// the policy. A malformed sealed grant denies the whole request (fail closed).
+	// (2) subject validity + admission binding.
+	if principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.PlatformTenant() != a.expectedTenant {
+		return Identity{}, ErrDenied
+	}
+	// (3) immutable server-operation route — caller cannot substitute a weaker route.
+	route, ok := a.routes[op]
+	if !ok {
+		return Identity{}, ErrDenied
+	}
+	// (4) sealed assertion trust + expiry against the Authorizer's own clock.
+	if !a.trustAccepts(principal) {
+		return Identity{}, ErrDenied
+	}
+	// (5) sealed capabilities parsed here (never caller-authored); a malformed grant denies.
 	caps := make([]Capability, 0, len(principal.Capabilities()))
 	for _, s := range principal.Capabilities() {
 		c, err := ParseCapability(s)
@@ -355,50 +369,35 @@ func (a *Authorizer) Authorize(ctx context.Context, policy CapabilityPolicy, pri
 		caps = append(caps, c)
 	}
 	held := NewCapabilitySet(caps...)
-	res, err := policy.Resolve(ctx, principal, route)
-	if err != nil {
-		return Identity{}, ErrDenied // non-disclosing
-	}
-	// (#2/#3) every held capability's realm must be trusted (home, or a live owner-ratified
-	// entry with first-use nonce).
-	for _, r := range held.realms() {
-		if !a.trust.trusts(r, nowMS, nonce) {
-			return Identity{}, ErrDenied
-		}
-	}
 	id := Identity{Subject: principal.Subject(), Capabilities: held}
 	switch route.mode {
 	case modeOwnerBound:
-		if !res.OwnerKey.valid() || !validRealm(res.Realm) || res.Realm != route.required.Realm() {
-			return Identity{}, ErrDenied // (#3) partition realm bound to capability realm
-		}
-		owner, ok := principal.Claim(string(res.OwnerKey)) // (#2) owner from sealed claim
-		if !ok || !validOwner(owner) {
+		owner := principal.Owner()
+		if !principal.HasOwner() || !validOwner(owner) || owner != bodyOwner {
 			return Identity{}, ErrDenied
 		}
-		os := newOwnerScope(res.Realm, owner)
-		if os.IsZero() {
-			return Identity{}, ErrDenied
-		}
-		if bodyOwner != "" && bodyOwner != os.Owner() { // body compare-only
-			return Identity{}, ErrDenied
-		}
-		if !held.Allows(route.required) { // sealed caps must cover the route
+		os := newOwnerScope(route.required.Realm(), owner)
+		if os.IsZero() || !held.Allows(route.required) {
 			return Identity{}, ErrDenied
 		}
 		id.OwnerScope = os
 	case modeGlobal:
-		// (#3/#5) no per-owner binding; the global route's realm is bound to the capability.
-		if bodyOwner != "" || res.OwnerKey != "" || res.Realm != route.required.Realm() {
+		if principal.HasOwner() || bodyOwner != "" {
 			return Identity{}, ErrDenied
 		}
 		if !held.Allows(route.required) {
 			return Identity{}, ErrDenied
 		}
-	case modeExplicitNone:
-		// enforcement opt-out; the handler's own token gate is separate.
 	default:
 		return Identity{}, ErrDenied
+	}
+	// (6) atomic replay consume LAST — a failed attempt above never reaches here, so it
+	// cannot poison the nonce; two concurrent identical uses yield exactly one success.
+	if n := principal.Nonce(); n != "" {
+		key := principal.Issuer() + "|" + principal.Audience() + "|" + principal.Version() + "|" + principal.Realm() + "|" + n
+		if !a.replay.consume(key) {
+			return Identity{}, ErrDenied
+		}
 	}
 	return id, nil
 }
