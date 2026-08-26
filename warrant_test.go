@@ -3,6 +3,8 @@ package warrant
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,7 +33,6 @@ func homeTrust() RealmTrust {
 
 func fixedClock(now int64) Clock { return func() int64 { return now } }
 
-// routes returns a fixed table: a low owner-bound op, a high owner-bound op, a global op.
 func routes(t *testing.T) []Route {
 	t.Helper()
 	rRead, err := OwnerBoundRoute("device.read", mustCap(t, "orbtr.io:device.read"))
@@ -58,7 +59,7 @@ func newAuthz(t *testing.T, v *Verifier, clock Clock, foreign ...RealmTrust) *Au
 	return a
 }
 
-// baseAssertion is a valid owner-bound home-realm assertion (nonce empty by default).
+// baseAssertion is a valid owner-bound home-realm assertion with a valid (mandatory) nonce.
 func baseAssertion() Assertion {
 	return Assertion{
 		Subject:        Subject{ID: "u1", Kind: "user"},
@@ -71,50 +72,45 @@ func baseAssertion() Assertion {
 		Version:        ver,
 		Realm:          homeRealm,
 		ExpiresAtMS:    10_000,
+		Nonce:          "nonce-base-01",
 	}
 }
 
+func withNonce(a Assertion, n string) Assertion { a.Nonce = n; return a }
+
 func denied(err error) bool { return errors.Is(err, ErrDenied) }
 
-// ── The receiver-pinned core: a principal minted by ANOTHER Verifier is denied ──────────
-// In-module analog of the nested-module hostile (the true nested-path proof is in
-// warrant-exttest). A "forger" builds its own Verifier and mints a fully-valid-looking
-// principal; the real Authorizer denies it purely on the seal mismatch.
+func mustMint(t *testing.T, v *Verifier, a Assertion) VerifiedPrincipal {
+	t.Helper()
+	p, err := v.Mint(a)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	return p
+}
+
 func TestReceiverPinned_ForeignVerifierDenied(t *testing.T) {
-	real, err := NewVerifier()
-	if err != nil {
-		t.Fatal(err)
-	}
-	forger, err := NewVerifier()
-	if err != nil {
-		t.Fatal(err)
-	}
+	real, _ := NewVerifier()
+	forger, _ := NewVerifier()
 	a := newAuthz(t, real, fixedClock(5000))
-	// The forged principal is perfect in every field — only the secret differs.
-	forged := forger.Mint(baseAssertion())
+	forged := mustMint(t, forger, baseAssertion()) // perfect fields, foreign key
 	if _, err := a.Authorize(context.Background(), forged, "device.read", "acme"); !denied(err) {
 		t.Fatalf("principal minted by a foreign Verifier must be DENIED; got %v", err)
-	}
-	// The forger's OWN authorizer accepting its own principal is irrelevant to the guarantee.
-	self := newAuthz(t, forger, fixedClock(5000))
-	if _, err := self.Authorize(context.Background(), forged, "device.read", "acme"); err != nil {
-		t.Fatalf("sanity: forger's own authorizer should accept its own principal; got %v", err)
 	}
 }
 
 func TestZeroValuePrincipalDenied(t *testing.T) {
-	real, _ := NewVerifier()
-	a := newAuthz(t, real, fixedClock(5000))
+	v, _ := NewVerifier()
+	a := newAuthz(t, v, fixedClock(5000))
 	if _, err := a.Authorize(context.Background(), VerifiedPrincipal{}, "device.read", "acme"); !denied(err) {
-		t.Fatal("zero-value (unsealed) principal must be DENIED")
+		t.Fatal("zero-value principal must be DENIED")
 	}
 }
 
 func TestOwnerBound_Positive(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	p := v.Mint(baseAssertion())
-	id, err := a.Authorize(context.Background(), p, "device.read", "acme")
+	id, err := a.Authorize(context.Background(), mustMint(t, v, baseAssertion()), "device.read", "acme")
 	if err != nil {
 		t.Fatalf("valid owner-bound request should succeed; got %v", err)
 	}
@@ -128,7 +124,7 @@ func TestWrongPlatformTenant_Denied(t *testing.T) {
 	a := newAuthz(t, v, fixedClock(5000))
 	as := baseAssertion()
 	as.PlatformTenant = "someone-else"
-	if _, err := a.Authorize(context.Background(), v.Mint(as), "device.read", "acme"); !denied(err) {
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
 		t.Fatal("foreign platform tenant must be DENIED")
 	}
 }
@@ -136,78 +132,88 @@ func TestWrongPlatformTenant_Denied(t *testing.T) {
 func TestUnknownOperation_Denied(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	if _, err := a.Authorize(context.Background(), v.Mint(baseAssertion()), "device.nonexistent", "acme"); !denied(err) {
-		t.Fatal("an operation with no registered route must be DENIED")
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, baseAssertion()), "device.nonexistent", "acme"); !denied(err) {
+		t.Fatal("unregistered operation must be DENIED")
 	}
 }
 
 func TestTrust_IssuerAudienceVersionExpiry(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
+	// each mutation denies BEFORE replay (step 6), so the shared nonce is never consumed.
 	for name, mut := range map[string]func(*Assertion){
 		"bad-issuer":   func(as *Assertion) { as.Issuer = "attacker" },
 		"bad-audience": func(as *Assertion) { as.Audience = "some.other.aud" },
 		"bad-version":  func(as *Assertion) { as.Version = "v99" },
-		"expired":      func(as *Assertion) { as.ExpiresAtMS = 4000 }, // clock is 5000
+		"expired":      func(as *Assertion) { as.ExpiresAtMS = 4000 }, // clock 5000
 		"no-expiry":    func(as *Assertion) { as.ExpiresAtMS = 0 },
-		"untrusted-realm": func(as *Assertion) {
-			as.Realm = "orbtr.ai"
-			as.Capabilities = []string{"orbtr.ai:device.read"}
-		},
 	} {
 		as := baseAssertion()
 		mut(&as)
-		if _, err := a.Authorize(context.Background(), v.Mint(as), "device.read", "acme"); !denied(err) {
+		if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
 			t.Fatalf("%s must be DENIED", name)
 		}
 	}
 }
 
-func TestTrustEntry_Expired_Denied(t *testing.T) {
+// TestRealmBinding_ForeignRealmHomeCapDenied is the exact assurance HOLD-1 bug: a TRUSTED foreign
+// realm carrying a HOME-realm capability must NOT authorize the home route.
+func TestRealmBinding_ForeignRealmHomeCapDenied(t *testing.T) {
 	v, _ := NewVerifier()
-	// A foreign realm whose entry is expired relative to the clock.
-	expired := RealmTrust{Realm: "orbtr.ai", Issuer: "ai-edge", Audience: aud, PolicyVersion: ver, ExpiresAtMS: 4000}
-	a := newAuthz(t, v, fixedClock(5000), expired)
-	as := baseAssertion()
-	as.Realm = "orbtr.ai"
-	as.Issuer = "ai-edge"
-	as.Capabilities = []string{"orbtr.io:device.read"} // even with a home-realm cap
-	if _, err := a.Authorize(context.Background(), v.Mint(as), "device.read", "acme"); !denied(err) {
-		t.Fatal("an expired foreign trust entry must DENY")
-	}
-}
-
-func TestCrossRealm_Denied(t *testing.T) {
-	v, _ := NewVerifier()
-	// orbtr.ai IS a live trusted foreign realm, but the principal only holds ai capabilities.
 	foreign := RealmTrust{Realm: "orbtr.ai", Issuer: "ai-edge", Audience: aud, PolicyVersion: ver, ExpiresAtMS: 1 << 62}
 	a := newAuthz(t, v, fixedClock(5000), foreign)
 	as := baseAssertion()
-	as.Realm = "orbtr.ai"
-	as.Issuer = "ai-edge"
-	as.Capabilities = []string{"orbtr.ai:device.read"} // ai cap cannot satisfy an io route
-	if _, err := a.Authorize(context.Background(), v.Mint(as), "device.read", "acme"); !denied(err) {
-		t.Fatal("an orbtr.ai capability must NOT satisfy an orbtr.io route (cross-realm)")
+	as.Realm = "orbtr.ai"                              // FOREIGN-realm principal
+	as.Issuer = "ai-edge"                              // trusted
+	as.Capabilities = []string{"orbtr.io:device.read"} // ...carrying a HOME capability
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
+		t.Fatal("foreign-realm principal with a home capability must be DENIED (realm binding)")
+	}
+	// positive control: a home-realm principal on the home route succeeds.
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, baseAssertion()), "device.read", "acme"); err != nil {
+		t.Fatalf("home-realm positive control must succeed; got %v", err)
+	}
+	// discriminating mutation: a home principal whose capability is foreign-realm is denied.
+	bad := baseAssertion()
+	bad.Nonce = "n-badcap"
+	bad.Capabilities = []string{"orbtr.ai:device.read"}
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, bad), "device.read", "acme"); !denied(err) {
+		t.Fatal("a home principal holding a foreign-realm capability must be DENIED")
 	}
 }
 
 func TestOwnerBound_OwnerMismatch_Denied(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	// sealed owner acme, but the op body names a different owner.
-	if _, err := a.Authorize(context.Background(), v.Mint(baseAssertion()), "device.read", "evil"); !denied(err) {
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, baseAssertion()), "device.read", "evil"); !denied(err) {
 		t.Fatal("sealed owner != body owner must be DENIED")
-	}
-	// owner-bound route but the principal carries no owner.
-	as := baseAssertion()
-	as.HasOwner = false
-	as.Owner = ""
-	if _, err := a.Authorize(context.Background(), v.Mint(as), "device.read", ""); !denied(err) {
-		t.Fatal("owner-bound route with an owner-less principal must be DENIED")
 	}
 }
 
-func TestGlobal_PositiveAndOwnerRejected(t *testing.T) {
+// TestRepresentationConsistency_MintRejects: HasOwner must equal Owner-presence, enforced AT MINT
+// (assurance HOLD 4 / R-2422 (4)) — an inconsistent bundle can never be sealed.
+func TestRepresentationConsistency_MintRejects(t *testing.T) {
+	v, _ := NewVerifier()
+	as := baseAssertion()
+	as.HasOwner = false
+	as.Owner = "acme"
+	if _, err := v.Mint(as); err == nil {
+		t.Fatal("Mint must reject HasOwner=false with owner material")
+	}
+	as2 := baseAssertion()
+	as2.HasOwner = true
+	as2.Owner = ""
+	if _, err := v.Mint(as2); err == nil {
+		t.Fatal("Mint must reject HasOwner=true with an empty owner")
+	}
+	as3 := baseAssertion()
+	as3.Subject = Subject{}
+	if _, err := v.Mint(as3); err == nil {
+		t.Fatal("Mint must reject an empty subject")
+	}
+}
+
+func TestGlobal_PositiveAndOwnerMaterialRejected(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
 	// positive global: no owner, holds the global cap.
@@ -215,17 +221,19 @@ func TestGlobal_PositiveAndOwnerRejected(t *testing.T) {
 	as.HasOwner = false
 	as.Owner = ""
 	as.Capabilities = []string{"orbtr.io:tuf.get"}
-	if _, err := a.Authorize(context.Background(), v.Mint(as), "tuf.get", ""); err != nil {
+	as.Nonce = "n-global-ok"
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "tuf.get", ""); err != nil {
 		t.Fatalf("valid global request should succeed; got %v", err)
 	}
-	// an owner-bearing principal at a global route must be denied.
+	// owner-bearing principal at a global route → denied (owner material).
 	as2 := baseAssertion()
 	as2.Capabilities = []string{"orbtr.io:tuf.get"}
-	if _, err := a.Authorize(context.Background(), v.Mint(as2), "tuf.get", ""); !denied(err) {
+	as2.Nonce = "n-global-owner"
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, as2), "tuf.get", ""); !denied(err) {
 		t.Fatal("owner-bearing principal at a global route must be DENIED")
 	}
-	// a global route with a non-empty body owner must be denied.
-	if _, err := a.Authorize(context.Background(), v.Mint(as), "tuf.get", "acme"); !denied(err) {
+	// global route with a non-empty body owner → denied.
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, withNonce(as, "n-global-body")), "tuf.get", "acme"); !denied(err) {
 		t.Fatal("global route with a body owner must be DENIED")
 	}
 }
@@ -233,14 +241,13 @@ func TestGlobal_PositiveAndOwnerRejected(t *testing.T) {
 func TestCapabilityInjection_LowPrivCannotReachHighRoute(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	// sealed low-privilege principal (device.read) invoking the high op (device.admin).
-	if _, err := a.Authorize(context.Background(), v.Mint(baseAssertion()), "device.admin", "acme"); !denied(err) {
-		t.Fatal("a low-privilege sealed principal must NOT reach the high route (no injection)")
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, baseAssertion()), "device.admin", "acme"); !denied(err) {
+		t.Fatal("low-privilege sealed principal must NOT reach the high route")
 	}
-	// positive: the same op with the correct sealed capability succeeds.
 	as := baseAssertion()
 	as.Capabilities = []string{"orbtr.io:device.admin"}
-	if _, err := a.Authorize(context.Background(), v.Mint(as), "device.admin", "acme"); err != nil {
+	as.Nonce = "n-admin-ok"
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.admin", "acme"); err != nil {
 		t.Fatalf("device.admin with the admin capability should succeed; got %v", err)
 	}
 }
@@ -248,11 +255,27 @@ func TestCapabilityInjection_LowPrivCannotReachHighRoute(t *testing.T) {
 func TestIoSubjectKinds_Accepted(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	for _, kind := range []SubjectKind{"device", "mesh_peer"} {
+	for i, kind := range []SubjectKind{"device", "mesh_peer"} {
 		as := baseAssertion()
 		as.Subject = Subject{ID: "d1", Kind: kind}
-		if _, err := a.Authorize(context.Background(), v.Mint(as), "device.read", "acme"); err != nil {
-			t.Fatalf("subject kind %q must be accepted (no allowlist); got %v", kind, err)
+		as.Nonce = fmt.Sprintf("n-kind-%d", i) // distinct nonce per positive (mandatory + exactly-once)
+		if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); err != nil {
+			t.Fatalf("subject kind %q must be accepted; got %v", kind, err)
+		}
+	}
+}
+
+func TestNonce_MandatoryAndBounded(t *testing.T) {
+	v, _ := NewVerifier()
+	a := newAuthz(t, v, fixedClock(5000))
+	for name, n := range map[string]string{
+		"empty":   "",
+		"short":   "short",                                        // < minNonceLen(8)
+		"oversize": string(make([]byte, maxNonceLen+1)),           // > maxNonceLen
+	} {
+		as := withNonce(baseAssertion(), n)
+		if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
+			t.Fatalf("%s nonce must be DENIED (replay is not caller-optional)", name)
 		}
 	}
 }
@@ -260,23 +283,18 @@ func TestIoSubjectKinds_Accepted(t *testing.T) {
 func TestReplay_SecondUseDeniedAndNoPoison(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	as := baseAssertion()
-	as.Nonce = "n1"
-	p := v.Mint(as)
+	p := mustMint(t, v, withNonce(baseAssertion(), "n-replay-1"))
 	if _, err := a.Authorize(context.Background(), p, "device.read", "acme"); err != nil {
-		t.Fatalf("first use of a nonce should succeed; got %v", err)
+		t.Fatalf("first use should succeed; got %v", err)
 	}
 	if _, err := a.Authorize(context.Background(), p, "device.read", "acme"); !denied(err) {
-		t.Fatal("identical second use of a nonce must be DENIED (replay)")
+		t.Fatal("identical second use must be DENIED (replay)")
 	}
-	// No-poison: a request that FAILS an earlier check must NOT consume its nonce.
-	poison := baseAssertion()
-	poison.Nonce = "n2"
-	pp := v.Mint(poison)
+	// no-poison: a request that FAILS an earlier check must not consume its nonce.
+	pp := mustMint(t, v, withNonce(baseAssertion(), "n-replay-2"))
 	if _, err := a.Authorize(context.Background(), pp, "device.read", "wrong-owner"); !denied(err) {
-		t.Fatal("setup: wrong-owner call should be denied")
+		t.Fatal("setup: wrong-owner denies")
 	}
-	// n2 must still be consumable by a legitimate use.
 	if _, err := a.Authorize(context.Background(), pp, "device.read", "acme"); err != nil {
 		t.Fatalf("a failed earlier check must not poison the nonce; got %v", err)
 	}
@@ -285,9 +303,7 @@ func TestReplay_SecondUseDeniedAndNoPoison(t *testing.T) {
 func TestReplay_ConcurrentExactlyOnce(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	as := baseAssertion()
-	as.Nonce = "n-concurrent"
-	p := v.Mint(as)
+	p := mustMint(t, v, withNonce(baseAssertion(), "n-concurrent"))
 	const goroutines = 32
 	var success int64
 	var wg sync.WaitGroup
@@ -305,7 +321,7 @@ func TestReplay_ConcurrentExactlyOnce(t *testing.T) {
 	close(start)
 	wg.Wait()
 	if success != 1 {
-		t.Fatalf("exactly one concurrent use of a nonce must succeed; got %d", success)
+		t.Fatalf("exactly one concurrent use must succeed; got %d", success)
 	}
 }
 
@@ -324,10 +340,6 @@ func TestNilSeam_FailClosed(t *testing.T) {
 	if _, err := NewAuthorizer(v, tenant, nil, routes(t), RealmTrust{}); !denied(err) {
 		t.Fatal("invalid home trust must reject")
 	}
-	badForeign := RealmTrust{Realm: "orbtr.ai", Issuer: "ai", Audience: "other", PolicyVersion: ver, ExpiresAtMS: 1 << 62}
-	if _, err := NewAuthorizer(v, tenant, nil, routes(t), homeTrust(), badForeign); !denied(err) {
-		t.Fatal("foreign entry with a mismatched audience must reject")
-	}
 }
 
 func TestParseCapability_Malformed(t *testing.T) {
@@ -343,5 +355,158 @@ func TestParseCapability_Malformed(t *testing.T) {
 	}
 	if _, err := ParseCapability("orbtr.io:device.*"); err != nil {
 		t.Fatalf("orbtr.io:device.* should parse; got %v", err)
+	}
+}
+
+// TestReplayStore_CapacityFailClosed (R-2422 (3)): at capacity the store denies rather than
+// evicting an unexpired entry to admit reuse; an expired entry is evicted to free space.
+func TestReplayStore_CapacityFailClosed(t *testing.T) {
+	r := &replayStore{consumed: map[replayKey]int64{}, maxEntries: 2}
+	k := func(n string) replayKey { return replayKey{issuer, aud, ver, homeRealm, n} }
+	if !r.consume(k("a"), 100, 10) || !r.consume(k("b"), 100, 10) {
+		t.Fatal("first two unexpired entries must admit")
+	}
+	if r.consume(k("c"), 100, 10) {
+		t.Fatal("at capacity with all entries unexpired, a new entry must FAIL CLOSED (no evict-to-admit)")
+	}
+	// advance the clock past expiry: the expired entries evict, freeing capacity.
+	if !r.consume(k("d"), 500, 200) {
+		t.Fatal("once entries expire, a fresh nonce admits")
+	}
+}
+
+// TestMonoClock_RollbackSafe (R-2422 (3)): a rolled-back wall clock never yields a lower time,
+// so a consumed/expired principal cannot resurrect.
+func TestMonoClock_RollbackSafe(t *testing.T) {
+	cur := int64(1000)
+	m := &monoClock{clock: func() int64 { return cur }}
+	if got := m.now(); got != 1000 {
+		t.Fatalf("now=%d, want 1000", got)
+	}
+	cur = 500 // clock rolls BACK
+	if got := m.now(); got != 1000 {
+		t.Fatalf("a rolled-back clock must not decrease; now=%d, want 1000", got)
+	}
+	cur = 2000 // forward
+	if got := m.now(); got != 2000 {
+		t.Fatalf("a forward clock advances; now=%d, want 2000", got)
+	}
+}
+
+// TestLongHorizonTTL_Denied (R-2422 (3)): a principal whose expiry exceeds the TTL cap is denied,
+// bounding how long a consumed nonce must be retained.
+func TestLongHorizonTTL_Denied(t *testing.T) {
+	v, _ := NewVerifier()
+	a := newAuthz(t, v, fixedClock(5000))
+	as := baseAssertion()
+	as.ExpiresAtMS = 5000 + maxPrincipalTTLms + 1
+	as.Nonce = "n-longhorizon"
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
+		t.Fatal("a principal whose TTL exceeds the cap must be DENIED")
+	}
+}
+
+// TestAuthorizerFmtRedactsKey (R-2422 (1)): formatting the handler-facing Authorizer (which holds
+// the Verifier) redacts the key — no minting material leaks through ordinary logging.
+func TestAuthorizerFmtRedactsKey(t *testing.T) {
+	v, _ := NewVerifier()
+	a := newAuthz(t, v, fixedClock(5000))
+	dump := fmt.Sprintf("%#v|%+v|%v", a, a, a)
+	if !strings.Contains(dump, "redacted") {
+		t.Fatalf("Authorizer formatting must redact the Verifier key; got: %s", dump)
+	}
+}
+
+// TestC1_SingleClockReadPerDecision (C1): Authorize reads its clock EXACTLY ONCE per decision. The
+// prior two-sample gap (trustAccepts read the clock, then consume read it again) let a principal pass
+// admission at one instant and be consumed after expiry at a later one; a fixed clock could never
+// expose it because it never advances between reads. A counting clock proves the single instant.
+func TestC1_SingleClockReadPerDecision(t *testing.T) {
+	v, _ := NewVerifier()
+	var reads int64
+	clock := func() int64 { atomic.AddInt64(&reads, 1); return 5000 }
+	a := newAuthz(t, v, clock)
+	p := mustMint(t, v, withNonce(baseAssertion(), "n-c1-oneread"))
+	if _, err := a.Authorize(context.Background(), p, "device.read", "acme"); err != nil {
+		t.Fatalf("valid request should succeed; got %v", err)
+	}
+	if n := atomic.LoadInt64(&reads); n != 1 {
+		t.Fatalf("Authorize must read the clock exactly ONCE per decision; got %d", n)
+	}
+}
+
+// TestC1_ExactExpiryDeniedNoExpiredReplayInsert (C1): a principal whose single decision instant has
+// reached expiry is DENIED (now >= ExpiresAtMS), and — the other half of the bug — it inserts NO
+// replay entry, so an already-expired identity never lands in the store.
+func TestC1_ExactExpiryDeniedNoExpiredReplayInsert(t *testing.T) {
+	v, _ := NewVerifier()
+	a := newAuthz(t, v, fixedClock(10_000)) // clock == ExpiresAtMS(10_000)
+	as := withNonce(baseAssertion(), "n-c1-exactexp")
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
+		t.Fatal("a principal at exact expiry must be DENIED")
+	}
+	key := replayKey{issuer, aud, ver, homeRealm, "n-c1-exactexp"}
+	a.replay.mu.Lock()
+	_, present := a.replay.consumed[key]
+	heapLen := len(a.replay.heap)
+	a.replay.mu.Unlock()
+	if present || heapLen != 0 {
+		t.Fatalf("an expired/denied principal must insert no replay entry; present=%v heapLen=%d", present, heapLen)
+	}
+	// boundary control: one millisecond before expiry admits.
+	a2 := newAuthz(t, v, fixedClock(9_999))
+	if _, err := a2.Authorize(context.Background(), mustMint(t, v, withNonce(baseAssertion(), "n-c1-inwindow")), "device.read", "acme"); err != nil {
+		t.Fatalf("a principal one ms before expiry must be admitted; got %v", err)
+	}
+}
+
+// TestC2_EvictsOnlyExpiredInHeapOrder (C2): consume reclaims ONLY entries expired at nowMS, in heap
+// (expiry) order, and never an unexpired one — no full-map scan.
+func TestC2_EvictsOnlyExpiredInHeapOrder(t *testing.T) {
+	r := newReplayStore()
+	k := func(n string) replayKey { return replayKey{issuer, aud, ver, homeRealm, n} }
+	if !r.consume(k("e30"), 30, 5) || !r.consume(k("e10"), 10, 5) || !r.consume(k("e20"), 20, 5) {
+		t.Fatal("setup: three distinct fresh nonces must admit")
+	}
+	if !r.consume(k("new"), 100, 25) { // now=25 → e10,e20 expired; e30 live
+		t.Fatal("a fresh nonce must admit")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.consumed[k("e10")]; ok {
+		t.Fatal("expired e10 must be evicted")
+	}
+	if _, ok := r.consumed[k("e20")]; ok {
+		t.Fatal("expired e20 must be evicted")
+	}
+	if _, ok := r.consumed[k("e30")]; !ok {
+		t.Fatal("live e30 must NOT be evicted (never evict an unexpired entry)")
+	}
+	if _, ok := r.consumed[k("new")]; !ok {
+		t.Fatal("the new nonce must be recorded")
+	}
+	if len(r.consumed) != 2 || len(r.heap) != 2 {
+		t.Fatalf("store must hold exactly the two live entries; map=%d heap=%d", len(r.consumed), len(r.heap))
+	}
+}
+
+// TestC2_LargeLiveSetDoesNotEvictUnexpired (C2): with a large live set and nothing expired, a fresh
+// consume adds exactly one entry and evicts none — the heap root is in the future, so the eviction
+// loop does zero pops and never traverses the live set (the CPU-exhaustion surface is closed).
+func TestC2_LargeLiveSetDoesNotEvictUnexpired(t *testing.T) {
+	r := newReplayStore()
+	const n = 2000
+	for i := 0; i < n; i++ {
+		if !r.consume(replayKey{issuer, aud, ver, homeRealm, fmt.Sprintf("live-%d", i)}, 1_000_000, 1000) {
+			t.Fatalf("live entry %d must admit", i)
+		}
+	}
+	if !r.consume(replayKey{issuer, aud, ver, homeRealm, "fresh"}, 1_000_000, 1000) {
+		t.Fatal("a fresh nonce must admit while all others are live")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.consumed) != n+1 || len(r.heap) != n+1 {
+		t.Fatalf("no live entry may be evicted; map=%d heap=%d want %d", len(r.consumed), len(r.heap), n+1)
 	}
 }

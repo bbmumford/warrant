@@ -90,8 +90,9 @@ func main() {
 		Version:        "v1",
 		Realm:          "orbtr.io",
 		ExpiresAtMS:    10000,
+		Nonce:          "nonce-nested-01",
 	}
-	forged := forger.Mint(as)
+	forged, _ := forger.Mint(as)
 
 	_, errReal := realAz.Authorize(context.Background(), forged, "device.read", "acme")
 	_, errForger := forgerAz.Authorize(context.Background(), forged, "device.read", "acme")

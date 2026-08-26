@@ -1,33 +1,46 @@
-// Package mint is the receiver-pinned seal root of warrant (plan §16.1). The security
-// guarantee is NOT the internal/ path boundary — that boundary is defeatable, because Go
-// internal visibility is import-path ancestry, so a module named under
-// github.com/bbmumford/warrant/... can still import this package. The guarantee is the
-// SECRET: a Verifier holds a per-instance secret from crypto/rand, Mint stamps a copy of
-// it into the principal's seal, and only a Verifier holding the SAME secret verifies it.
-// A nested-path forger can import mint and call NewVerifier()+Mint, but it stamps ITS OWN
-// secret; the real host Authorizer (a different Verifier) denies it. internal/ remains only
-// as defense-in-depth (sibling/external modules cannot even import), never as the root.
+// Package mint is the receiver-pinned seal root of warrant (plan §16.1). Authenticity is a MAC,
+// not a copied secret: a Verifier holds a per-instance HMAC key (crypto/rand), Mint stamps the
+// principal with a TAG = HMAC(key, canonical(assertion)), and Verify recomputes the tag with the
+// key and compares it in constant time. The KEY NEVER ENTERS A PRINCIPAL — a principal carries
+// only the tag (a MAC output over public assertion fields) plus those fields, so reflecting/
+// logging a principal (fmt %#v) discloses no key material and enables no forgery (forging a new
+// assertion's tag requires the key, held only by the Verifier). This closes the secret-custody
+// hole where a copied key leaked through ordinary formatting.
 package mint
 
 import (
+	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
+	"errors"
 )
 
-// SubjectKind is scope-agnostic: no product allowlist is baked in. Validity is "non-empty",
-// enforced at the authority seam (cortex user/service; io device/mesh_peer both pass).
+// ErrMint is returned by Mint when the assertion is invalid at mint time (inconsistent owner
+// representation, or an empty subject) — the trusted edge must not seal an inconsistent bundle.
+var ErrMint = errors.New("mint: invalid assertion")
+
+// Domain separation + versioning for the MAC input: the tag authenticates THIS assertion schema
+// at THIS version, so a tag can never be reused across a different context or a future format.
+const (
+	canonicalContext = "warrant.assertion"
+	canonicalVersion = uint64(1)
+)
+
+// SubjectKind is scope-agnostic: no product allowlist baked in.
 type SubjectKind string
 
-// Subject is the authenticated actor. Who, not what-they-may-do.
+// Subject is the authenticated actor.
 type Subject struct {
 	ID   string
 	Kind SubjectKind
 }
 
-// Assertion is the sealed evidence the TRUSTED edge presents at mint, derived from a
-// completed real authentication. Every field becomes receiver-verified at Authorize; none
-// is caller-authored at authorize time. Owner is the sealed partition (org); HasOwner
-// distinguishes an owner-bound principal from a global (owner-less) one.
+// Assertion is the sealed evidence the trusted edge presents at mint. Owner is the opaque
+// partition; HasOwner distinguishes owner-bound from global. Consistency invariant: HasOwner
+// must equal (Owner != "") — enforced by Consistent().
 type Assertion struct {
 	Subject        Subject
 	PlatformTenant string
@@ -42,12 +55,14 @@ type Assertion struct {
 	Nonce          string
 }
 
-// VerifiedPrincipal is opaque sealed proof of authentication. The seal is a copy of the
-// minting Verifier's secret; it has NO accessor and never leaves this package, so no
-// consumer can read it or forge one by struct literal (all fields unexported). Every other
-// field is exposed read-only for the authority seam.
+// Consistent reports whether HasOwner agrees with Owner presence. The authority seam denies an
+// inconsistent assertion (owner material on a would-be global, or a claimed owner with no value).
+func (a Assertion) Consistent() bool { return a.HasOwner == (a.Owner != "") }
+
+// VerifiedPrincipal is opaque proof. It carries the assertion fields plus the MAC tag — NOT the
+// key. All fields unexported; there is no exported setter, and no accessor exposes the key
+// (there is no key here to expose). Verifying requires the Verifier that holds the key.
 type VerifiedPrincipal struct {
-	seal      []byte
 	subject   Subject
 	tenant    string
 	hasOwner  bool
@@ -59,38 +74,38 @@ type VerifiedPrincipal struct {
 	realm     string
 	expiresMS int64
 	nonce     string
+	tag       []byte // HMAC(key, canonical(assertion)); a non-secret MAC output, never the key
 }
 
-const secretLen = 32
+const keyLen = 32
 
-// Verifier holds a per-instance secret generated at construction from crypto/rand. The
-// trusted host creates ONE and shares it between the edge adapter (which Mints principals
-// from real auth) and the Authorizer (which Verifies). The secret is never exported,
-// serialized, logged, or accessible — the receiver-pinned root of trust.
+// Verifier holds the per-instance HMAC key. The trusted host creates ONE and shares it between
+// its authentication edge (Mint) and its Authorizer (Verify). The key is never exported,
+// serialized, logged, or copied into a principal.
 type Verifier struct {
-	secret []byte
+	key []byte
 }
 
-// NewVerifier generates a fresh per-instance secret. Two Verifiers never share a secret,
-// so a principal minted by one is denied by the other.
+// NewVerifier generates a fresh per-instance HMAC key.
 func NewVerifier() (*Verifier, error) {
-	s := make([]byte, secretLen)
-	if _, err := rand.Read(s); err != nil {
+	k := make([]byte, keyLen)
+	if _, err := rand.Read(k); err != nil {
 		return nil, err
 	}
-	return &Verifier{secret: s}, nil
+	return &Verifier{key: k}, nil
 }
 
-// Mint stamps a principal with THIS verifier's secret plus the sealed assertion (claims and
-// capabilities defensively copied so a later caller mutation cannot alter sealed evidence).
-// Only code holding this *Verifier can produce a principal this verifier accepts.
-func (v *Verifier) Mint(a Assertion) VerifiedPrincipal {
-	seal := make([]byte, len(v.secret))
-	copy(seal, v.secret)
+// Mint stamps a principal with tag = HMAC(key, canonical(assertion)). It validates the assertion
+// at mint time (owner-representation consistency + non-empty subject) and returns ErrMint on an
+// invalid bundle, so the trusted edge cannot seal an inconsistent one. Claims/caps are defensively
+// copied. The key is not stored in the principal.
+func (v *Verifier) Mint(a Assertion) (VerifiedPrincipal, error) {
+	if !a.Consistent() || a.Subject.ID == "" || a.Subject.Kind == "" {
+		return VerifiedPrincipal{}, ErrMint
+	}
 	caps := make([]string, len(a.Capabilities))
 	copy(caps, a.Capabilities)
-	return VerifiedPrincipal{
-		seal:      seal,
+	p := VerifiedPrincipal{
 		subject:   a.Subject,
 		tenant:    a.PlatformTenant,
 		hasOwner:  a.HasOwner,
@@ -103,36 +118,96 @@ func (v *Verifier) Mint(a Assertion) VerifiedPrincipal {
 		expiresMS: a.ExpiresAtMS,
 		nonce:     a.Nonce,
 	}
+	p.tag = v.mac(p.assertion())
+	return p, nil
 }
 
-// Verify reports whether p was sealed by THIS verifier, using a CONSTANT-TIME comparison
-// (R-2411 pin 4). A principal minted by any other Verifier — including a nested-path
-// forger's own — fails, as does a zero-value principal (empty seal). This is the whole
-// forgery closure: it depends on the secret, not on who could import this package.
+// GoString and String redact the key on the VALUE receiver (so both Verifier and *Verifier, and a
+// dereferenced copy, redact) — ordinary formatting/logging discloses no minting material (R-2422 (1)).
+func (v Verifier) GoString() string { return "mint.Verifier{key:(redacted)}" }
+func (v Verifier) String() string   { return "mint.Verifier{redacted}" }
+
+// Verify recomputes the tag over the principal's fields with the Verifier's key and compares it
+// in constant time. A principal minted by any other Verifier — or a zero value (nil tag) — fails.
 func (v *Verifier) Verify(p VerifiedPrincipal) bool {
-	if len(v.secret) != secretLen || len(p.seal) != secretLen {
+	if len(v.key) != keyLen || len(p.tag) != sha256.Size {
 		return false
 	}
-	return subtle.ConstantTimeCompare(p.seal, v.secret) == 1
+	expected := v.mac(p.assertion())
+	return subtle.ConstantTimeCompare(expected, p.tag) == 1
 }
 
-// Read-only accessors. There is deliberately NO seal accessor and NO exported setter, so a
-// principal a handler holds cannot be read for its secret nor mutated into a different one.
+func (v *Verifier) mac(a Assertion) []byte {
+	m := hmac.New(sha256.New, v.key)
+	m.Write(canonical(a))
+	return m.Sum(nil)
+}
 
+// assertion rebuilds the Assertion from the principal's fields (for tag recomputation).
+func (p VerifiedPrincipal) assertion() Assertion {
+	caps := make([]string, len(p.caps))
+	copy(caps, p.caps)
+	return Assertion{
+		Subject: p.subject, PlatformTenant: p.tenant, HasOwner: p.hasOwner, Owner: p.owner,
+		Capabilities: caps, Issuer: p.issuer, Audience: p.audience, Version: p.version,
+		Realm: p.realm, ExpiresAtMS: p.expiresMS, Nonce: p.nonce,
+	}
+}
+
+// canonical is a deterministic, UNAMBIGUOUS length-prefixed encoding of every authority-bearing
+// field, so the tag covers the whole assertion and no two distinct assertions collide (no
+// delimiter ambiguity). Any field change invalidates the tag.
+func canonical(a Assertion) []byte {
+	var b bytes.Buffer
+	writeStr(&b, canonicalContext) // domain separation
+	writeUint(&b, canonicalVersion) // schema version
+	writeStr(&b, string(a.Subject.Kind))
+	writeStr(&b, a.Subject.ID)
+	writeStr(&b, a.PlatformTenant)
+	if a.HasOwner {
+		b.WriteByte(1)
+	} else {
+		b.WriteByte(0)
+	}
+	writeStr(&b, a.Owner)
+	writeUint(&b, uint64(len(a.Capabilities)))
+	for _, c := range a.Capabilities {
+		writeStr(&b, c)
+	}
+	writeStr(&b, a.Issuer)
+	writeStr(&b, a.Audience)
+	writeStr(&b, a.Version)
+	writeStr(&b, a.Realm)
+	writeUint(&b, uint64(a.ExpiresAtMS))
+	writeStr(&b, a.Nonce)
+	return b.Bytes()
+}
+
+func writeStr(b *bytes.Buffer, s string) {
+	writeUint(b, uint64(len(s)))
+	b.WriteString(s)
+}
+
+func writeUint(b *bytes.Buffer, n uint64) {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], n)
+	b.Write(buf[:])
+}
+
+// Read-only accessors. There is NO tag accessor and NO key anywhere in the principal, so a value
+// a handler holds discloses no minting material.
 func (p VerifiedPrincipal) Subject() Subject       { return p.subject }
 func (p VerifiedPrincipal) PlatformTenant() string { return p.tenant }
 func (p VerifiedPrincipal) HasOwner() bool         { return p.hasOwner }
 func (p VerifiedPrincipal) Owner() string          { return p.owner }
 
-// Capabilities returns a defensive copy of the SEALED effective grants (edge-derived). The
-// authority seam parses + matches against these; a consumer cannot add to them.
 func (p VerifiedPrincipal) Capabilities() []string {
 	out := make([]string, len(p.caps))
 	copy(out, p.caps)
 	return out
 }
 
-func (p VerifiedPrincipal) Issuer() string     { return p.issuer }
+func (p VerifiedPrincipal) Issuer() string      { return p.issuer }
 func (p VerifiedPrincipal) Audience() string    { return p.audience }
 func (p VerifiedPrincipal) Version() string     { return p.version }
 func (p VerifiedPrincipal) Realm() string       { return p.realm }

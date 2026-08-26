@@ -222,23 +222,130 @@ func (rt RealmTrust) valid() bool {
 // accepts no caller-supplied time (R-2411 pin 3).
 type Clock func() int64
 
-// replayStore holds consumed assertion identities. consume is atomic: two concurrent
-// identical uses yield exactly ONE first-use success.
-type replayStore struct {
-	mu       sync.Mutex
-	consumed map[string]struct{}
+const (
+	// maxPrincipalTTLms caps how far in the future an assertion may expire — bounds how long a
+	// consumed nonce must be retained for replay defense (R-2422 (3) long-horizon).
+	maxPrincipalTTLms = int64(24 * 60 * 60 * 1000) // 24h
+	// maxReplayEntries caps live consumed-nonce storage; at capacity, consume FAILS CLOSED rather
+	// than evicting an unexpired entry to admit reuse (R-2422 (3) capacity).
+	maxReplayEntries = 1 << 20
+)
+
+// monoClock wraps a Clock with a monotonic high-water mark: a rolled-back wall clock never yields
+// a time earlier than one already observed, so an expired/evicted principal cannot resurrect and
+// a consumed nonce cannot be un-expired (R-2422 (3) rollback-safe).
+type monoClock struct {
+	mu    sync.Mutex
+	clock Clock
+	hw    int64
 }
 
-func newReplayStore() *replayStore { return &replayStore{consumed: map[string]struct{}{}} }
+func (m *monoClock) now() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t := m.clock(); t > m.hw {
+		m.hw = t
+	}
+	return m.hw
+}
 
-func (r *replayStore) consume(key string) bool {
+// A request principal MUST carry a non-empty, bounded replay nonce (assurance HOLD 2): replay is
+// never caller-optional. Bounds reject an empty or oversize nonce.
+const (
+	minNonceLen = 8
+	maxNonceLen = 128
+)
+
+// replayKey is a TYPED, unambiguous consumed-assertion identity (no delimiter concatenation).
+type replayKey struct {
+	issuer, audience, version, realm, nonce string
+}
+
+// replayStore holds consumed identities keyed to their assertion expiry, so storage is bounded: a
+// nonce is dead once its assertion expires (it is also denied at the trust/expiry check). consume is
+// atomic — two concurrent identical uses yield exactly ONE first-use success — and reclaims expired
+// entries through a min-heap ordered by expiry, so an ordinary consume never traverses the live set.
+// A full-map scan per authorization was a CPU-exhaustion surface: with a large live set an attacker
+// supplying fresh valid nonces forced O(live) work per request. Here every expired entry sits at the
+// heap root, so a consume with nothing expired does zero pops; each entry is pushed once and popped
+// once (amortized O(log n)). The map and heap stay 1:1 — a key is inserted only while live, and its
+// heap entry is popped (and the map entry deleted) once its expiry passes, before any re-insertion.
+type replayEntry struct {
+	key    replayKey
+	expiry int64
+}
+
+type replayStore struct {
+	mu         sync.Mutex
+	consumed   map[replayKey]int64 // key → assertion expiry (ms); only LIVE entries survive a consume
+	heap       []replayEntry       // min-heap by expiry: bounded eviction, never a full live-set scan
+	maxEntries int
+}
+
+func newReplayStore() *replayStore {
+	return &replayStore{consumed: map[replayKey]int64{}, maxEntries: maxReplayEntries}
+}
+
+// consume records key (valid until expiryMS) and returns true on FIRST use, using the single decision
+// instant nowMS the caller already sampled — never its own clock read, so admission and consume agree
+// on one instant. It evicts ONLY entries whose assertion has expired at nowMS (from the heap root
+// outward), then enforces exactly-once and a fail-closed capacity that never evicts an UNEXPIRED entry
+// to admit reuse.
+func (r *replayStore) consume(key replayKey, expiryMS, nowMS int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for len(r.heap) > 0 && r.heap[0].expiry <= nowMS {
+		e := r.heapPop()
+		// Lazy 1:1 delete: drop the map entry only for the same insertion this heap node recorded.
+		if cur, ok := r.consumed[e.key]; ok && cur == e.expiry {
+			delete(r.consumed, e.key)
+		}
+	}
 	if _, used := r.consumed[key]; used {
 		return false
 	}
-	r.consumed[key] = struct{}{}
+	if len(r.consumed) >= r.maxEntries {
+		return false // fail-closed at capacity; never evict an UNEXPIRED entry to admit reuse
+	}
+	r.consumed[key] = expiryMS
+	r.heapPush(replayEntry{key: key, expiry: expiryMS})
 	return true
+}
+
+// heapPush/heapPop keep r.heap a binary min-heap ordered by expiry. Hand-rolled so the consumed
+// identities stay unboxed on the authorization hot path (no container/heap interface conversion).
+func (r *replayStore) heapPush(e replayEntry) {
+	r.heap = append(r.heap, e)
+	for i := len(r.heap) - 1; i > 0; {
+		parent := (i - 1) / 2
+		if r.heap[parent].expiry <= r.heap[i].expiry {
+			break
+		}
+		r.heap[parent], r.heap[i] = r.heap[i], r.heap[parent]
+		i = parent
+	}
+}
+
+func (r *replayStore) heapPop() replayEntry {
+	n := len(r.heap) - 1
+	top := r.heap[0]
+	r.heap[0] = r.heap[n]
+	r.heap = r.heap[:n]
+	for i := 0; ; {
+		l, rr, smallest := 2*i+1, 2*i+2, i
+		if l < n && r.heap[l].expiry < r.heap[smallest].expiry {
+			smallest = l
+		}
+		if rr < n && r.heap[rr].expiry < r.heap[smallest].expiry {
+			smallest = rr
+		}
+		if smallest == i {
+			break
+		}
+		r.heap[i], r.heap[smallest] = r.heap[smallest], r.heap[i]
+		i = smallest
+	}
+	return top
 }
 
 // Identity is what a handler receives from a successful Authorize.
@@ -258,9 +365,14 @@ type Authorizer struct {
 	audience       string
 	trust          map[string]RealmTrust
 	routes         map[OperationID]Route
-	clock          Clock
+	mono           *monoClock
 	replay         *replayStore
 }
+
+// GoString and String redact the handler-facing Authorizer: it holds the Verifier (and thus the
+// minting key), so ordinary formatting/logging must never expand it into its fields (R-2422 (1)).
+func (a *Authorizer) GoString() string { return "warrant.Authorizer{redacted: holds Verifier key}" }
+func (a *Authorizer) String() string   { return "warrant.Authorizer{redacted}" }
 
 // NewAuthorizer validates the receiver config, every trust entry, and every route at
 // construction (fail-closed): nil verifier, empty tenant, invalid home trust, an invalid or
@@ -299,7 +411,7 @@ func NewAuthorizer(verifier *Verifier, expectedTenant string, clock Clock, route
 		audience:       home.Audience,
 		trust:          trust,
 		routes:         rm,
-		clock:          clock,
+		mono:           &monoClock{clock: clock},
 		replay:         newReplayStore(),
 	}, nil
 }
@@ -308,7 +420,7 @@ func NewAuthorizer(verifier *Verifier, expectedTenant string, clock Clock, route
 // Authorizer's OWN clock: the principal's realm must have a live (unrevoked, unexpired) trust
 // entry whose issuer/audience/version match the sealed assertion, the token must not be
 // expired, and its audience must be this receiver's.
-func (a *Authorizer) trustAccepts(p VerifiedPrincipal) bool {
+func (a *Authorizer) trustAccepts(p VerifiedPrincipal, now int64) bool {
 	realm := p.Realm()
 	if !validRealm(realm) {
 		return false
@@ -317,11 +429,11 @@ func (a *Authorizer) trustAccepts(p VerifiedPrincipal) bool {
 	if !ok {
 		return false
 	}
-	now := a.clock()
 	if e.Revoked || e.ExpiresAtMS <= now {
 		return false
 	}
-	if p.ExpiresAtMS() <= 0 || now >= p.ExpiresAtMS() {
+	// expired, no-expiry, OR a TTL beyond the cap (bounds replay-map retention; R-2422 (3)).
+	if p.ExpiresAtMS() <= 0 || now >= p.ExpiresAtMS() || p.ExpiresAtMS() > now+maxPrincipalTTLms {
 		return false
 	}
 	if p.Audience() != a.audience {
@@ -339,7 +451,7 @@ func (a *Authorizer) trustAccepts(p VerifiedPrincipal) bool {
 func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal, op OperationID, bodyOwner string) (Identity, error) {
 	_ = ctx
 	// nil-seam fail-closed.
-	if a == nil || a.verifier == nil || a.replay == nil || a.clock == nil {
+	if a == nil || a.verifier == nil || a.replay == nil || a.mono == nil {
 		return Identity{}, ErrDenied
 	}
 	// (1) receiver-pinned seal — a principal minted by any other Verifier is denied.
@@ -350,20 +462,41 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	if principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.PlatformTenant() != a.expectedTenant {
 		return Identity{}, ErrDenied
 	}
+	// (2a) representation consistency — HasOwner must agree with Owner presence (assurance HOLD 4).
+	if principal.HasOwner() != (principal.Owner() != "") {
+		return Identity{}, ErrDenied
+	}
+	// (2b) MANDATORY bounded replay nonce — replay is never caller-optional (assurance HOLD 2).
+	if n := principal.Nonce(); len(n) < minNonceLen || len(n) > maxNonceLen {
+		return Identity{}, ErrDenied
+	}
 	// (3) immutable server-operation route — caller cannot substitute a weaker route.
 	route, ok := a.routes[op]
 	if !ok {
 		return Identity{}, ErrDenied
 	}
-	// (4) sealed assertion trust + expiry against the Authorizer's own clock.
-	if !a.trustAccepts(principal) {
+	// (3a) REALM BINDING — the principal's realm must equal the route's realm (assurance HOLD 1);
+	// a foreign-realm assertion cannot authorize a home route even carrying a home-realm capability.
+	if principal.Realm() != route.required.Realm() {
 		return Identity{}, ErrDenied
 	}
-	// (5) sealed capabilities parsed here (never caller-authored); a malformed grant denies.
+	// (4) ONE authoritative decision instant, sampled ONCE here — after every non-time authority
+	// check (seal, subject, tenant, representation, nonce, route, realm) and before both the trust/
+	// expiry admission and the replay consume below, which now share it. A single monotonic read per
+	// decision closes the two-sample gap: previously trustAccepts read the clock and consume read it
+	// again, so a principal could pass admission at the first instant and be consumed — inserting an
+	// already-expired replay entry — after crossing expiry at the second. monoClock keeps it
+	// rollback-safe, and trustAccepts denies at now >= ExpiresAtMS (exact-expiry).
+	nowMS := a.mono.now()
+	if !a.trustAccepts(principal, nowMS) {
+		return Identity{}, ErrDenied
+	}
+	// (5) sealed capabilities parsed here (never caller-authored); a malformed grant denies. Every
+	// capability MUST be in the principal's realm (assurance HOLD 1) — no cross-realm capability.
 	caps := make([]Capability, 0, len(principal.Capabilities()))
 	for _, s := range principal.Capabilities() {
 		c, err := ParseCapability(s)
-		if err != nil {
+		if err != nil || c.Realm() != principal.Realm() {
 			return Identity{}, ErrDenied
 		}
 		caps = append(caps, c)
@@ -382,7 +515,8 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 		}
 		id.OwnerScope = os
 	case modeGlobal:
-		if principal.HasOwner() || bodyOwner != "" {
+		// global routes deny ANY owner material (assurance HOLD 4).
+		if principal.HasOwner() || principal.Owner() != "" || bodyOwner != "" {
 			return Identity{}, ErrDenied
 		}
 		if !held.Allows(route.required) {
@@ -391,13 +525,12 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	default:
 		return Identity{}, ErrDenied
 	}
-	// (6) atomic replay consume LAST — a failed attempt above never reaches here, so it
-	// cannot poison the nonce; two concurrent identical uses yield exactly one success.
-	if n := principal.Nonce(); n != "" {
-		key := principal.Issuer() + "|" + principal.Audience() + "|" + principal.Version() + "|" + principal.Realm() + "|" + n
-		if !a.replay.consume(key) {
-			return Identity{}, ErrDenied
-		}
+	// (6) atomic replay consume LAST — the nonce is mandatory (checked at 2b), so every request is
+	// exactly-once. A failed check above never reaches here, so it cannot poison the nonce; two
+	// concurrent identical uses yield exactly one success. Typed key, expiry-bounded storage.
+	key := replayKey{principal.Issuer(), principal.Audience(), principal.Version(), principal.Realm(), principal.Nonce()}
+	if !a.replay.consume(key, principal.ExpiresAtMS(), nowMS) {
+		return Identity{}, ErrDenied
 	}
 	return id, nil
 }
