@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -628,4 +631,51 @@ func TestC2a_SameKeyExpireReinsert(t *testing.T) {
 	if r.consumed[k] != 1_000 || len(r.consumed) != 1 || len(r.heap) != 1 {
 		t.Fatalf("map/heap must be 1:1 with the reinserted expiry; map[k]=%d len(map)=%d len(heap)=%d", r.consumed[k], len(r.consumed), len(r.heap))
 	}
+}
+
+// TestC2b_ConsumeDoesNotRangeLiveMap (R-2427 C2b durable proof): the op-count witness measures only
+// the heap loop, so a regression that adds `range r.consumed` ELSEWHERE in consume would not move it.
+// This is the mutation-discriminating guard: a source-AST assertion that the consume path
+// (replayStore.consume + its heap eviction helpers) contains NO range over the live map r.consumed —
+// the exact O(N) live-map scan the heap design removed. Adding such a range turns this test RED.
+func TestC2b_ConsumeDoesNotRangeLiveMap(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "warrant.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse warrant.go: %v", err)
+	}
+	guarded := map[string]bool{"consume": true, "heapPop": true, "heapPush": true}
+	seen := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || !guarded[fn.Name.Name] || !isReplayStoreReceiver(fn.Recv) {
+			return true
+		}
+		seen[fn.Name.Name] = true
+		ast.Inspect(fn.Body, func(m ast.Node) bool {
+			if rng, ok := m.(*ast.RangeStmt); ok {
+				if sel, ok := rng.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "consumed" {
+					t.Errorf("%s ranges over the live map r.consumed — the O(N) live-map scan C2b forbids", fn.Name.Name)
+				}
+			}
+			return true
+		})
+		return true
+	})
+	// Guard the guard: a rename of consume must not silently disable this check.
+	if !seen["consume"] {
+		t.Fatal("did not find *replayStore.consume to inspect — the AST guard checks nothing")
+	}
+}
+
+func isReplayStoreReceiver(recv *ast.FieldList) bool {
+	if recv == nil || len(recv.List) != 1 {
+		return false
+	}
+	star, ok := recv.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	id, ok := star.X.(*ast.Ident)
+	return ok && id.Name == "replayStore"
 }
