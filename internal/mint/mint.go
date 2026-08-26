@@ -21,24 +21,31 @@ type Subject struct {
 
 // VerifiedPrincipal is opaque proof of authentication. All fields unexported; the only
 // way verified becomes true is Mint. External packages can construct only a zero value
-// (verified=false), which the authority seam denies.
+// (verified=false), which the authority seam denies. Both the owner claims AND the
+// effective capabilities are SEALED here at mint by the trusted edge — a consumer
+// CapabilityPolicy can therefore neither inject an owner nor inject a capability
+// (R-2405 #1): the authority seam reads capabilities from this sealed evidence, never
+// from a policy return value.
 type VerifiedPrincipal struct {
 	verified       bool
 	subject        Subject
 	platformTenant string            // axis 1: admission fact ("orbtr"); NOT a partition, NOT authority
 	claims         map[string]string // defensively copied at mint; owner is a SEALED claim read by key
+	capabilities   []string          // SEALED effective grants ("<realm>:<resource>.<action>"), edge-derived from real auth
 }
 
 // Mint turns a completed authentication into a VerifiedPrincipal. Called ONLY by
 // warrant's trusted edge adapter (same-module, may import internal/mint) after real
-// verification — never by a handler package. Claims are defensively copied so a later
-// caller mutation cannot alter the sealed evidence.
-func Mint(subject Subject, platformTenant string, claims map[string]string) VerifiedPrincipal {
+// verification — never by a handler package. Claims + capabilities are defensively
+// copied so a later caller mutation cannot alter the sealed evidence.
+func Mint(subject Subject, platformTenant string, claims map[string]string, capabilities []string) VerifiedPrincipal {
 	cp := make(map[string]string, len(claims))
 	for k, v := range claims {
 		cp[k] = v
 	}
-	return VerifiedPrincipal{verified: true, subject: subject, platformTenant: platformTenant, claims: cp}
+	caps := make([]string, len(capabilities))
+	copy(caps, capabilities)
+	return VerifiedPrincipal{verified: true, subject: subject, platformTenant: platformTenant, claims: cp, capabilities: caps}
 }
 
 // Read-only accessors — the authority seam reads provenance through these; there is no
@@ -53,4 +60,13 @@ func (p VerifiedPrincipal) PlatformTenant() string { return p.platformTenant }
 func (p VerifiedPrincipal) Claim(k string) (string, bool) {
 	v, ok := p.claims[k]
 	return v, ok
+}
+
+// Capabilities returns a defensive copy of the SEALED effective grants (edge-derived).
+// The authority seam parses + matches against these; a consumer policy cannot add to
+// them (R-2405 #1 capability-injection closure).
+func (p VerifiedPrincipal) Capabilities() []string {
+	out := make([]string, len(p.capabilities))
+	copy(out, p.capabilities)
+	return out
 }

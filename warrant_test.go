@@ -10,9 +10,23 @@ import (
 
 const now = 1_000_000
 
-// verified mints a real principal (in-module test may import internal/mint).
-func verified(claims map[string]string) VerifiedPrincipal {
-	return mint.Mint(Subject{ID: "u1", Kind: "user"}, "orbtr", claims)
+// principalWith mints a verified principal with SEALED caps + claims (in-module test may
+// import internal/mint; an external module cannot — see warrant-exttest).
+func principalWith(caps []string, claims map[string]string) VerifiedPrincipal {
+	return mint.Mint(Subject{ID: "u1", Kind: "user"}, "orbtr", claims, caps)
+}
+
+func liveTrust(realm string) RealmTrust {
+	return RealmTrust{Realm: realm, Issuer: "iss", Audience: "aud", PolicyVersion: "v1", ExpiresAtMS: now + 1_000}
+}
+
+func authorizer(t *testing.T, entries ...RealmTrust) *Authorizer {
+	t.Helper()
+	a, err := NewAuthorizer("orbtr", "orbtr.ai", "aud", entries...)
+	if err != nil {
+		t.Fatalf("NewAuthorizer: %v", err)
+	}
+	return a
 }
 
 func cap(t *testing.T, s string) Capability {
@@ -42,164 +56,190 @@ func global(t *testing.T, c string) Route {
 	return r
 }
 
-type stub struct {
+type routeOnly struct {
 	res Resolution
 	err error
 }
 
-func (s stub) Resolve(context.Context, VerifiedPrincipal, Route) (Resolution, error) {
-	return s.res, s.err
+func (p routeOnly) Resolve(context.Context, VerifiedPrincipal, Route) (Resolution, error) {
+	return p.res, p.err
 }
 
-// homeTrust trusts only orbtr.ai (the receiver's home) unless entries are added.
-func homeTrust(entries ...RealmTrust) StaticTrust { return NewStaticTrust("orbtr.ai", entries...) }
-
-func auth(policy CapabilityPolicy, trust TrustEvaluator, p VerifiedPrincipal, route Route, bodyOwner string) (Identity, error) {
-	return Authorize(context.Background(), policy, trust, p, route, bodyOwner, now)
+func run(a *Authorizer, pol CapabilityPolicy, p VerifiedPrincipal, route Route, bodyOwner, nonce string) (Identity, error) {
+	return a.Authorize(context.Background(), pol, p, route, bodyOwner, now, nonce)
 }
 
-// ── #1 forgery: a zero-value (external-constructible) principal is unverified → DENY ──
-func TestAuthorize_ForgedUnverifiedPrincipal_Denied(t *testing.T) {
-	pol := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:x.read"))}}
-	if _, err := auth(pol, homeTrust(), VerifiedPrincipal{}, ownerBound(t, "orbtr.ai:x.read"), "acme"); !errors.Is(err, ErrDenied) {
-		t.Fatalf("forged unverified principal must DENY; got %v", err)
+// ── #1 principal forgery: zero-value principal is unverified → DENY ──
+func TestForgedPrincipal_Denied(t *testing.T) {
+	pol := routeOnly{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg}}
+	if _, err := run(authorizer(t), pol, VerifiedPrincipal{}, ownerBound(t, "orbtr.ai:x.read"), "acme", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("forged unverified principal must DENY")
 	}
 }
 
-func TestAuthorize_NilPolicyOrTrustOrRoute_Denied(t *testing.T) {
-	p := verified(map[string]string{"org": "acme"})
-	if _, err := auth(nil, homeTrust(), p, ownerBound(t, "orbtr.ai:x.read"), ""); !errors.Is(err, ErrDenied) {
+// ── #1 CAPABILITY injection: caps come from the SEALED principal, not the policy. A
+// low-privilege principal + a route requiring a higher cap DENIES even though the policy
+// returns valid routing — the policy cannot grant the missing capability. ──
+func TestCapabilityInjection_Closed(t *testing.T) {
+	// sealed low-priv cap only; route requires a cap the principal does NOT hold.
+	p := principalWith([]string{"orbtr.ai:low.read"}, map[string]string{"org": "acme"})
+	pol := routeOnly{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg}} // valid routing, no grants
+	if _, err := run(authorizer(t), pol, p, ownerBound(t, "orbtr.ai:admin.write"), "acme", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("a policy must NOT be able to authorize a capability absent from the sealed principal")
+	}
+	// positive: the same route WITH the sealed cap present succeeds.
+	p2 := principalWith([]string{"orbtr.ai:admin.write"}, map[string]string{"org": "acme"})
+	if _, err := run(authorizer(t), pol, p2, ownerBound(t, "orbtr.ai:admin.write"), "acme", ""); err != nil {
+		t.Fatalf("sealed cap present must succeed; got %v", err)
+	}
+}
+
+func TestNilPolicyOrInvalidRoute_Denied(t *testing.T) {
+	p := principalWith([]string{"orbtr.ai:x.read"}, map[string]string{"org": "acme"})
+	if _, err := run(authorizer(t), nil, p, ownerBound(t, "orbtr.ai:x.read"), "", ""); !errors.Is(err, ErrDenied) {
 		t.Fatal("nil policy must DENY")
 	}
-	if _, err := Authorize(context.Background(), stub{}, nil, p, ownerBound(t, "orbtr.ai:x.read"), "", now); !errors.Is(err, ErrDenied) {
-		t.Fatal("nil trust must DENY")
-	}
-	if _, err := auth(stub{}, homeTrust(), p, Route{}, ""); !errors.Is(err, ErrDenied) {
+	if _, err := run(authorizer(t), routeOnly{}, p, Route{}, "", ""); !errors.Is(err, ErrDenied) {
 		t.Fatal("invalid route must DENY")
 	}
 }
 
-// ── #4 principal validity ──
-func TestAuthorize_PrincipalValidity_Denied(t *testing.T) {
-	pol := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:x.read"))}}
+// ── #4 principal validity + platform-tenant admission binding ──
+func TestPrincipalValidity_And_PlatformTenantBinding(t *testing.T) {
+	pol := routeOnly{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg}}
+	route := ownerBound(t, "orbtr.ai:x.read")
+	caps := []string{"orbtr.ai:x.read"}
 	for name, p := range map[string]VerifiedPrincipal{
-		"empty subject id":   mint.Mint(Subject{ID: "", Kind: "user"}, "orbtr", map[string]string{"org": "acme"}),
-		"empty subject kind": mint.Mint(Subject{ID: "u1", Kind: ""}, "orbtr", map[string]string{"org": "acme"}),
-		"empty platform ten": mint.Mint(Subject{ID: "u1", Kind: "user"}, "", map[string]string{"org": "acme"}),
+		"empty id":          mint.Mint(Subject{ID: "", Kind: "user"}, "orbtr", map[string]string{"org": "acme"}, caps),
+		"empty kind":        mint.Mint(Subject{ID: "u", Kind: ""}, "orbtr", map[string]string{"org": "acme"}, caps),
+		"foreign plat tenant": mint.Mint(Subject{ID: "u", Kind: "user"}, "evil", map[string]string{"org": "acme"}, caps),
+		"empty plat tenant":   mint.Mint(Subject{ID: "u", Kind: "user"}, "", map[string]string{"org": "acme"}, caps),
 	} {
-		if _, err := auth(pol, homeTrust(), p, ownerBound(t, "orbtr.ai:x.read"), "acme"); !errors.Is(err, ErrDenied) {
-			t.Fatalf("%s must DENY; got %v", name, err)
+		if _, err := run(authorizer(t), pol, p, route, "acme", ""); !errors.Is(err, ErrDenied) {
+			t.Fatalf("%s must DENY", name)
 		}
 	}
-	// io kinds must be accepted (no hard-coded allowlist): device/mesh_peer succeed.
+	// io kinds accepted (no hard-coded allowlist).
 	for _, k := range []SubjectKind{"device", "mesh_peer"} {
-		p := mint.Mint(Subject{ID: "d1", Kind: k}, "orbtr", map[string]string{"org": "acme"})
-		if _, err := auth(pol, homeTrust(), p, ownerBound(t, "orbtr.ai:x.read"), "acme"); err != nil {
-			t.Fatalf("io kind %q must be accepted (scope-agnostic); got %v", k, err)
+		p := mint.Mint(Subject{ID: "d", Kind: k}, "orbtr", map[string]string{"org": "acme"}, caps)
+		if _, err := run(authorizer(t), pol, p, route, "acme", ""); err != nil {
+			t.Fatalf("io kind %q must be accepted; got %v", k, err)
 		}
 	}
 }
 
-// ── #2 sealed owner from claim; absent claim → DENY (policy cannot inject a raw owner) ──
-func TestAuthorize_OwnerFromSealedClaim(t *testing.T) {
-	pol := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:x.read"))}}
-	// present sealed claim → bound to it.
-	id, err := auth(pol, homeTrust(), verified(map[string]string{"org": "acme"}), ownerBound(t, "orbtr.ai:x.read"), "acme")
+// ── #2 owner from sealed claim; absent → DENY; foreign body → DENY ──
+func TestSealedOwner_And_BodyCompare(t *testing.T) {
+	pol := routeOnly{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg}}
+	route := ownerBound(t, "orbtr.ai:x.read")
+	caps := []string{"orbtr.ai:x.read"}
+	id, err := run(authorizer(t), pol, principalWith(caps, map[string]string{"org": "acme"}), route, "acme", "")
 	if err != nil || id.OwnerScope.Owner() != "acme" {
-		t.Fatalf("owner must come from the sealed claim; got owner=%q err=%v", id.OwnerScope.Owner(), err)
+		t.Fatalf("owner must come from sealed claim; got owner=%q err=%v", id.OwnerScope.Owner(), err)
 	}
-	// absent sealed claim → DENY (no raw fallback).
-	if _, err := auth(pol, homeTrust(), verified(map[string]string{}), ownerBound(t, "orbtr.ai:x.read"), ""); !errors.Is(err, ErrDenied) {
+	if _, err := run(authorizer(t), pol, principalWith(caps, map[string]string{}), route, "", ""); !errors.Is(err, ErrDenied) {
 		t.Fatal("absent sealed owner claim must DENY")
 	}
-}
-
-func TestAuthorize_ForeignBodyOwner_Denied(t *testing.T) {
-	pol := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:x.read"))}}
-	if _, err := auth(pol, homeTrust(), verified(map[string]string{"org": "acme"}), ownerBound(t, "orbtr.ai:x.read"), "villain"); !errors.Is(err, ErrDenied) {
-		t.Fatal("foreign bodyOwner must DENY (compare-only)")
+	if _, err := run(authorizer(t), pol, principalWith(caps, map[string]string{"org": "acme"}), route, "villain", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("foreign bodyOwner must DENY")
 	}
 }
 
-// ── #3 cross-PRODUCT realm binding: ai capability must not authorize an io route (+ mirror) ──
-func TestAuthorize_CrossRealm_Denied(t *testing.T) {
-	// held ai caps, io OwnerBound route (+ io realm resolution): DENY.
-	polIO := stub{res: Resolution{Realm: "orbtr.io", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:x.read"))}}
-	if _, err := Authorize(context.Background(), polIO, NewStaticTrust("orbtr.io"), verified(map[string]string{"org": "acme"}), ownerBound(t, "orbtr.io:x.read"), "acme", now); !errors.Is(err, ErrDenied) {
-		t.Fatal("orbtr.ai capability must NOT authorize an orbtr.io route")
+// ── #3 cross-PRODUCT realm binding ──
+func TestCrossRealm_Denied(t *testing.T) {
+	// held ai cap, io OwnerBound route + io realm resolution → DENY.
+	a, _ := NewAuthorizer("orbtr", "orbtr.io", "aud")
+	polIO := routeOnly{res: Resolution{Realm: "orbtr.io", OwnerKey: ClaimOrg}}
+	pAI := mint.Mint(Subject{ID: "u", Kind: "user"}, "orbtr", map[string]string{"org": "acme"}, []string{"orbtr.ai:x.read"})
+	if _, err := a.Authorize(context.Background(), polIO, pAI, ownerBound(t, "orbtr.io:x.read"), "acme", now, ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("orbtr.ai sealed cap must NOT authorize an orbtr.io route")
 	}
-	// mirror: held io caps, ai route.
-	polAI := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.io:x.read"))}}
-	if _, err := auth(polAI, homeTrust(), verified(map[string]string{"org": "acme"}), ownerBound(t, "orbtr.ai:x.read"), "acme"); !errors.Is(err, ErrDenied) {
-		t.Fatal("orbtr.io capability must NOT authorize an orbtr.ai route (mirror)")
-	}
-	// realm-mismatch between resolved partition realm and required realm: DENY.
-	polMismatch := stub{res: Resolution{Realm: "orbtr.io", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:x.read"))}}
-	if _, err := auth(polMismatch, homeTrust(NowTrust("orbtr.io")), verified(map[string]string{"org": "acme"}), ownerBound(t, "orbtr.ai:x.read"), "acme"); !errors.Is(err, ErrDenied) {
+	// realm-mismatch attributable to the binding (trust orbtr.io so it's not the trust gate).
+	polMismatch := routeOnly{res: Resolution{Realm: "orbtr.io", OwnerKey: ClaimOrg}}
+	pAI2 := principalWith([]string{"orbtr.ai:x.read"}, map[string]string{"org": "acme"})
+	if _, err := run(authorizer(t, liveTrust("orbtr.io")), polMismatch, pAI2, ownerBound(t, "orbtr.ai:x.read"), "acme", ""); !errors.Is(err, ErrDenied) {
 		t.Fatal("partition realm != capability realm must DENY")
 	}
 }
 
-// ── #3 global: reject body owner AND policy owner key ──
-func TestAuthorize_GlobalOwnerAmbiguity_Denied(t *testing.T) {
-	polKey := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:promo.lookup"))}}
-	if _, err := auth(polKey, homeTrust(), verified(map[string]string{"org": "acme"}), global(t, "orbtr.ai:promo.lookup"), ""); !errors.Is(err, ErrDenied) {
-		t.Fatal("global route with a policy owner key must DENY")
-	}
-	polOK := stub{res: Resolution{Realm: "orbtr.ai", Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:promo.lookup"))}}
-	if _, err := auth(polOK, homeTrust(), verified(map[string]string{"org": "acme"}), global(t, "orbtr.ai:promo.lookup"), "acme"); !errors.Is(err, ErrDenied) {
-		t.Fatal("global route with a body owner must DENY")
-	}
+// ── #5 global realm binding + owner ambiguity ──
+func TestGlobal(t *testing.T) {
+	caps := []string{"orbtr.ai:promo.lookup"}
+	polNoOwner := routeOnly{res: Resolution{Realm: "orbtr.ai"}}
 	// clean global success → zero OwnerScope.
-	id, err := auth(polOK, homeTrust(), verified(map[string]string{"org": "acme"}), global(t, "orbtr.ai:promo.lookup"), "")
+	id, err := run(authorizer(t), polNoOwner, principalWith(caps, nil), global(t, "orbtr.ai:promo.lookup"), "", "")
 	if err != nil || !id.OwnerScope.IsZero() {
 		t.Fatalf("clean global must succeed with zero OwnerScope; got %+v err=%v", id.OwnerScope, err)
 	}
-}
-
-func TestAuthorize_MissingCapability_Denied(t *testing.T) {
-	pol := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet()}}
-	if _, err := auth(pol, homeTrust(), verified(map[string]string{"org": "acme"}), ownerBound(t, "orbtr.ai:x.read"), "acme"); !errors.Is(err, ErrDenied) {
-		t.Fatal("missing capability must DENY")
+	// global + policy owner key → DENY.
+	polKey := routeOnly{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg}}
+	if _, err := run(authorizer(t), polKey, principalWith(caps, map[string]string{"org": "acme"}), global(t, "orbtr.ai:promo.lookup"), "", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("global route with a policy owner key must DENY")
+	}
+	// global + body owner → DENY.
+	if _, err := run(authorizer(t), polNoOwner, principalWith(caps, nil), global(t, "orbtr.ai:promo.lookup"), "acme", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("global route with a body owner must DENY")
+	}
+	// global realm mismatch → DENY (#5).
+	polWrongRealm := routeOnly{res: Resolution{Realm: "orbtr.io"}}
+	if _, err := run(authorizer(t), polWrongRealm, principalWith(caps, nil), global(t, "orbtr.ai:promo.lookup"), "", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("global route realm mismatch must DENY")
 	}
 }
 
-func TestAuthorize_PolicyError_NonDisclosing(t *testing.T) {
-	secret := errors.New("org 42 not in registry")
-	_, err := auth(stub{err: secret}, homeTrust(), verified(map[string]string{"org": "acme"}), ownerBound(t, "orbtr.ai:x.read"), "acme")
-	if !errors.Is(err, ErrDenied) || errors.Is(err, secret) {
-		t.Fatalf("policy error must surface as ErrDenied and NOT disclose the secret; got %v", err)
-	}
-}
-
-// ── #5 foreign-realm capability is trust-gated; expiry/revocation/replay/absence fail closed ──
-func TestAuthorize_ForeignRealmCapability_TrustGated(t *testing.T) {
-	// A held capability in a FOREIGN realm (calndr) on an orbtr.ai route: the foreign
-	// realm must be trusted or the whole set is rejected.
-	pol := stub{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg, Capabilities: NewCapabilitySet(cap(t, "orbtr.ai:x.read"), cap(t, "calndr:y.read"))}}
+func TestMissingCapability_And_PolicyError(t *testing.T) {
+	pol := routeOnly{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg}}
 	route := ownerBound(t, "orbtr.ai:x.read")
-	p := verified(map[string]string{"org": "acme"})
-	// untrusted foreign realm → DENY.
-	if _, err := auth(pol, homeTrust(), p, route, "acme"); !errors.Is(err, ErrDenied) {
-		t.Fatal("untrusted foreign-realm capability must DENY")
+	// sealed caps empty → missing → DENY.
+	if _, err := run(authorizer(t), pol, principalWith(nil, map[string]string{"org": "acme"}), route, "acme", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("missing (empty sealed) capability must DENY")
 	}
-	// expired / revoked / replayed → DENY.
+	secret := errors.New("org 42 not in registry")
+	_, err := run(authorizer(t), routeOnly{err: secret}, principalWith([]string{"orbtr.ai:x.read"}, map[string]string{"org": "acme"}), route, "acme", "")
+	if !errors.Is(err, ErrDenied) || errors.Is(err, secret) {
+		t.Fatalf("policy error must be ErrDenied and non-disclosing; got %v", err)
+	}
+}
+
+// ── #2 trust validity + #3 replay ──
+func TestTrust_ValidityAndReplay(t *testing.T) {
+	// NewAuthorizer rejects an invalid trust entry.
+	if _, err := NewAuthorizer("orbtr", "orbtr.ai", "aud", RealmTrust{Realm: "calndr" /* missing issuer/audience/version/expiry */}); !errors.Is(err, ErrDenied) {
+		t.Fatal("NewAuthorizer must reject an invalid trust entry")
+	}
+	// a sealed FOREIGN-realm cap needs a live trust entry.
+	pol := routeOnly{res: Resolution{Realm: "orbtr.ai", OwnerKey: ClaimOrg}}
+	route := ownerBound(t, "orbtr.ai:x.read")
+	pForeign := principalWith([]string{"orbtr.ai:x.read", "calndr:y.read"}, map[string]string{"org": "acme"})
+	// untrusted foreign realm → DENY.
+	if _, err := run(authorizer(t), pol, pForeign, route, "acme", ""); !errors.Is(err, ErrDenied) {
+		t.Fatal("untrusted foreign-realm sealed cap must DENY")
+	}
+	// expired / revoked / wrong-audience → DENY.
 	for name, e := range map[string]RealmTrust{
-		"expired": {Realm: "calndr", ExpiresAtMS: now - 1},
-		"revoked": {Realm: "calndr", ExpiresAtMS: now + 1_000, Revoked: true},
-		"replay":  {Realm: "calndr", ExpiresAtMS: now + 1_000, NonceSeen: true},
+		"expired":  {Realm: "calndr", Issuer: "i", Audience: "aud", PolicyVersion: "v1", ExpiresAtMS: now - 1},
+		"revoked":  {Realm: "calndr", Issuer: "i", Audience: "aud", PolicyVersion: "v1", ExpiresAtMS: now + 1_000, Revoked: true},
+		"wrong-aud": {Realm: "calndr", Issuer: "i", Audience: "other", PolicyVersion: "v1", ExpiresAtMS: now + 1_000},
 	} {
-		if _, err := auth(pol, homeTrust(e), p, route, "acme"); !errors.Is(err, ErrDenied) {
-			t.Fatalf("%s foreign trust must DENY; got %v", name, err)
+		a, err := NewAuthorizer("orbtr", "orbtr.ai", "aud", e)
+		if err != nil {
+			t.Fatalf("%s ctor: %v", name, err)
+		}
+		if _, err := a.Authorize(context.Background(), pol, pForeign, route, "acme", now, ""); !errors.Is(err, ErrDenied) {
+			t.Fatalf("%s foreign trust must DENY", name)
 		}
 	}
-	// live trust → succeeds.
-	if _, err := auth(pol, homeTrust(RealmTrust{Realm: "calndr", ExpiresAtMS: now + 1_000}), p, route, "acme"); err != nil {
-		t.Fatalf("live foreign trust must permit; got %v", err)
+	// REPLAY: same nonce twice → first succeeds, second denies.
+	a := authorizer(t, liveTrust("calndr"))
+	if _, err := a.Authorize(context.Background(), pol, pForeign, route, "acme", now, "nonce-1"); err != nil {
+		t.Fatalf("first use of nonce must succeed; got %v", err)
+	}
+	if _, err := a.Authorize(context.Background(), pol, pForeign, route, "acme", now, "nonce-1"); !errors.Is(err, ErrDenied) {
+		t.Fatal("replayed nonce must DENY on second use")
 	}
 }
 
-func TestParseCapability_Malformed_Denied(t *testing.T) {
+func TestParseCapability_Malformed(t *testing.T) {
 	for _, s := range []string{"", "noresource", "realm:noaction", "orbtr.ai:x.read.extra", "orbtr.ai:x.RE", "UP:x.y", ":x.y", ".:x.y", "orbtr..ai:x.y", ".orbtr.ai:x.y", "orbtr.ai.:x.y", "orbtr.ai:.y", "orbtr.ai:x."} {
 		if _, err := ParseCapability(s); !errors.Is(err, ErrDenied) {
 			t.Fatalf("malformed %q must be denied", s)
@@ -209,22 +249,10 @@ func TestParseCapability_Malformed_Denied(t *testing.T) {
 
 func TestCapabilitySet_SameRealm_Wildcard_Subsumes(t *testing.T) {
 	set := NewCapabilitySet(cap(t, "orbtr.ai:x.*"))
-	if !set.Allows(cap(t, "orbtr.ai:x.read")) {
-		t.Fatal("same-realm wildcard must subsume")
+	if !set.Allows(cap(t, "orbtr.ai:x.read")) || set.Allows(cap(t, "orbtr.io:x.read")) || NewCapabilitySet().Allows(cap(t, "orbtr.ai:x.read")) {
+		t.Fatal("same-realm wildcard subsumes; cross-realm never; empty denies")
 	}
-	if set.Allows(cap(t, "orbtr.io:x.read")) {
-		t.Fatal("cross-realm must never subsume")
-	}
-	if NewCapabilitySet().Allows(cap(t, "orbtr.ai:x.read")) {
-		t.Fatal("empty set must deny")
-	}
-	if !set.Subsumes(NewCapabilitySet(cap(t, "orbtr.ai:x.read"))) {
-		t.Fatal("parent x.* must subsume child x.read")
-	}
-	if set.Subsumes(NewCapabilitySet(cap(t, "orbtr.ai:y.write"))) {
-		t.Fatal("child must not exceed parent")
+	if !set.Subsumes(NewCapabilitySet(cap(t, "orbtr.ai:x.read"))) || set.Subsumes(NewCapabilitySet(cap(t, "orbtr.ai:y.write"))) {
+		t.Fatal("subsumes clamp")
 	}
 }
-
-// NowTrust is a tiny helper: a live trust entry for realm r.
-func NowTrust(r string) RealmTrust { return RealmTrust{Realm: r, ExpiresAtMS: now + 1_000} }

@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 
 	"github.com/bbmumford/warrant/internal/mint"
 )
@@ -225,18 +226,20 @@ const (
 
 func (k ClaimKey) valid() bool { return k == ClaimOrg || k == ClaimUser }
 
-// Resolution is what a CapabilityPolicy returns. Realm is the consumer's own realm (a
-// canonical constant it operates, not attacker-derived). OwnerKey names the sealed claim
-// the owner is read from (empty for a Global route). Capabilities are the effective set.
+// Resolution is what a CapabilityPolicy returns — ROUTING only, never grants. Realm is
+// the consumer's own realm (a canonical constant it operates). OwnerKey names the sealed
+// claim the owner is read from (empty for a Global route). The effective CAPABILITIES are
+// NOT here: they are sealed into the VerifiedPrincipal at mint, so a policy cannot inject
+// them (R-2405 #1).
 type Resolution struct {
-	Realm        string
-	OwnerKey     ClaimKey
-	Capabilities CapabilitySet
+	Realm    string
+	OwnerKey ClaimKey
 }
 
-// CapabilityPolicy is the CONSUMER-SUPPLIED interpretation — warrant ships none. It reads
-// only the VerifiedPrincipal (never a request body) and returns a Resolution. It does NOT
-// enforce invariants or do the body compare — those are Authorize's job.
+// CapabilityPolicy is the CONSUMER-SUPPLIED routing interpretation — warrant ships none.
+// It reads only the VerifiedPrincipal (never a request body), returns a Resolution
+// (routing), and CANNOT author capabilities or the owner. It does not enforce invariants
+// or do the body compare — those are the Authorizer's job.
 type CapabilityPolicy interface {
 	Resolve(ctx context.Context, principal VerifiedPrincipal, route Route) (Resolution, error)
 }
@@ -249,12 +252,11 @@ type Identity struct {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (R-2399 #5) Receiver-local realm trust — concrete, consumed by Authorize.
+// (R-2405 #2/#3) Receiver-local realm trust — a CONCRETE owner-ratified store, not an
+// external interface; entries are validated at construction; replay is real state.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// RealmTrust binds a foreign realm's grants under receiver-local terms. Provenance is
-// not semantics: a foreign realm's capability counts only under a live, unrevoked,
-// unexpired, non-replayed trust entry.
+// RealmTrust is an owner-ratified receiver-local trust entry for a foreign realm.
 type RealmTrust struct {
 	Realm         string
 	Issuer        string
@@ -262,74 +264,115 @@ type RealmTrust struct {
 	PolicyVersion string
 	ExpiresAtMS   int64
 	Revoked       bool
-	NonceSeen     bool // replay: this trust assertion's nonce was already consumed
 }
 
-// TrustEvaluator decides whether a foreign realm is currently trusted. Concrete, not an
-// always-true interface: Trusted fails closed on expiry, revocation, replay, or absence.
-type TrustEvaluator interface {
-	Trusted(realm string, nowMS int64) bool
+func (rt RealmTrust) valid() bool {
+	return validRealm(rt.Realm) && rt.Issuer != "" && rt.Audience != "" && rt.PolicyVersion != "" && rt.ExpiresAtMS > 0
 }
 
-// StaticTrust is a concrete receiver-local evaluator over owner-ratified entries.
-type StaticTrust struct {
-	entries map[string]RealmTrust
-	home    string // the receiver's own realm — always trusted, never gated
+// trustStore is concrete (not an interface a caller can make always-true). It holds
+// owner-ratified entries + real replay state (consumed nonces).
+type trustStore struct {
+	home     string
+	entries  map[string]RealmTrust
+	mu       sync.Mutex
+	seen     map[string]struct{} // consumed replay nonces (real state, not a static bool)
+	audience string              // this receiver's expected audience
 }
 
-func NewStaticTrust(home string, entries ...RealmTrust) StaticTrust {
-	m := make(map[string]RealmTrust, len(entries))
-	for _, e := range entries {
-		m[e.Realm] = e
-	}
-	return StaticTrust{entries: m, home: home}
-}
-
-func (t StaticTrust) Trusted(realm string, nowMS int64) bool {
+// trusts reports whether realm is trusted right now. Home realm is always trusted. A
+// foreign realm needs a live, unrevoked, unexpired, audience-matching entry, and — when
+// the assertion carries a nonce — that nonce must be first-use (consumed here).
+func (t *trustStore) trusts(realm string, nowMS int64, nonce string) bool {
 	if realm == t.home {
-		return true // own realm needs no federation trust
+		return true
 	}
 	e, ok := t.entries[realm]
-	if !ok || e.Revoked || e.NonceSeen || e.ExpiresAtMS <= nowMS {
-		return false // fail closed: absent, revoked, replayed, or expired
+	if !ok || e.Revoked || e.ExpiresAtMS <= nowMS || e.Audience != t.audience {
+		return false // fail closed: absent, revoked, expired, wrong audience
+	}
+	if nonce != "" { // replay: first use succeeds, an identical second use is denied
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if _, used := t.seen[nonce]; used {
+			return false
+		}
+		t.seen[nonce] = struct{}{}
 	}
 	return true
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Authorize — the ONE enforcement seam AND the ONE reconcile home. Enforces every
-// invariant in the core; non-disclosing; consumes the TrustEvaluator.
-// ─────────────────────────────────────────────────────────────────────────────
+// Authorizer binds the receiver-local configuration — expected platform tenant, home
+// realm, audience, and owner-ratified trust — at construction. All of it is validated;
+// there is no external-implementable trust hook. This is the ONE enforcement seam.
+type Authorizer struct {
+	expectedPlatformTenant string
+	home                   string
+	trust                  *trustStore
+}
 
-// Authorize resolves the server-established Identity and enforces all invariants.
-// bodyOwner is the request's op-specific owner field (compare-only). nowMS + trust gate
-// foreign-realm capabilities. A nil policy or nil trust denies (fail-closed seams).
-func Authorize(ctx context.Context, policy CapabilityPolicy, trust TrustEvaluator, principal VerifiedPrincipal, route Route, bodyOwner string, nowMS int64) (Identity, error) {
-	if policy == nil || trust == nil || route.mode == modeInvalid {
+// NewAuthorizer validates the receiver config + every trust entry (R-2405 #2/#4). It
+// fails if the platform tenant or home realm is empty/non-canonical or any entry is
+// invalid — owner-ratified config, checked, not caller-trusted at use time.
+func NewAuthorizer(expectedPlatformTenant, homeRealm, audience string, entries ...RealmTrust) (*Authorizer, error) {
+	if expectedPlatformTenant == "" || !validRealm(homeRealm) || audience == "" {
+		return nil, ErrDenied
+	}
+	m := make(map[string]RealmTrust, len(entries))
+	for _, e := range entries {
+		if !e.valid() || e.Realm == homeRealm {
+			return nil, ErrDenied
+		}
+		m[e.Realm] = e
+	}
+	return &Authorizer{
+		expectedPlatformTenant: expectedPlatformTenant,
+		home:                   homeRealm,
+		trust:                  &trustStore{home: homeRealm, entries: m, seen: map[string]struct{}{}, audience: audience},
+	}, nil
+}
+
+// Authorize resolves the server-established Identity and enforces every invariant in the
+// core. bodyOwner is the op-specific owner field (compare-only). nonce is an optional
+// replay nonce for a presented trust assertion. Non-disclosing: every failure is ErrDenied.
+func (a *Authorizer) Authorize(ctx context.Context, policy CapabilityPolicy, principal VerifiedPrincipal, route Route, bodyOwner string, nowMS int64, nonce string) (Identity, error) {
+	if a == nil || policy == nil || route.mode == modeInvalid {
 		return Identity{}, ErrDenied
 	}
-	// (#4) principal validity — reject empty/foreign admission before policy grants.
-	if !principal.Verified() || principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.PlatformTenant() == "" {
+	// (#4) principal validity + admission: verified, non-empty subject, and the platform
+	// tenant must be the receiver's EXPECTED tenant (a foreign non-empty value is denied).
+	if !principal.Verified() || principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.PlatformTenant() != a.expectedPlatformTenant {
 		return Identity{}, ErrDenied
 	}
+	// (#1) effective capabilities come from the SEALED principal, parsed here — never from
+	// the policy. A malformed sealed grant denies the whole request (fail closed).
+	caps := make([]Capability, 0, len(principal.Capabilities()))
+	for _, s := range principal.Capabilities() {
+		c, err := ParseCapability(s)
+		if err != nil {
+			return Identity{}, ErrDenied
+		}
+		caps = append(caps, c)
+	}
+	held := NewCapabilitySet(caps...)
 	res, err := policy.Resolve(ctx, principal, route)
 	if err != nil {
 		return Identity{}, ErrDenied // non-disclosing
 	}
-	// Every held capability's realm must be trusted (home realm or a live RealmTrust).
-	for _, r := range res.Capabilities.realms() {
-		if !trust.Trusted(r, nowMS) {
+	// (#2/#3) every held capability's realm must be trusted (home, or a live owner-ratified
+	// entry with first-use nonce).
+	for _, r := range held.realms() {
+		if !a.trust.trusts(r, nowMS, nonce) {
 			return Identity{}, ErrDenied
 		}
 	}
-	id := Identity{Subject: principal.Subject(), Capabilities: res.Capabilities}
+	id := Identity{Subject: principal.Subject(), Capabilities: held}
 	switch route.mode {
 	case modeOwnerBound:
-		if !res.OwnerKey.valid() || !validRealm(res.Realm) {
-			return Identity{}, ErrDenied
+		if !res.OwnerKey.valid() || !validRealm(res.Realm) || res.Realm != route.required.Realm() {
+			return Identity{}, ErrDenied // (#3) partition realm bound to capability realm
 		}
-		// (#2) owner is a SEALED claim read by key — never a raw policy string.
-		owner, ok := principal.Claim(string(res.OwnerKey))
+		owner, ok := principal.Claim(string(res.OwnerKey)) // (#2) owner from sealed claim
 		if !ok || !validOwner(owner) {
 			return Identity{}, ErrDenied
 		}
@@ -337,24 +380,19 @@ func Authorize(ctx context.Context, policy CapabilityPolicy, trust TrustEvaluato
 		if os.IsZero() {
 			return Identity{}, ErrDenied
 		}
-		// (#3) partition realm must equal the required capability's realm.
-		if os.Realm() != route.required.Realm() {
+		if bodyOwner != "" && bodyOwner != os.Owner() { // body compare-only
 			return Identity{}, ErrDenied
 		}
-		// body compare-only.
-		if bodyOwner != "" && bodyOwner != os.Owner() {
-			return Identity{}, ErrDenied
-		}
-		if !res.Capabilities.Allows(route.required) {
+		if !held.Allows(route.required) { // sealed caps must cover the route
 			return Identity{}, ErrDenied
 		}
 		id.OwnerScope = os
 	case modeGlobal:
-		// (#3) no per-owner binding: reject a body owner AND a policy-supplied owner key.
-		if bodyOwner != "" || res.OwnerKey != "" {
+		// (#3/#5) no per-owner binding; the global route's realm is bound to the capability.
+		if bodyOwner != "" || res.OwnerKey != "" || res.Realm != route.required.Realm() {
 			return Identity{}, ErrDenied
 		}
-		if !res.Capabilities.Allows(route.required) {
+		if !held.Allows(route.required) {
 			return Identity{}, ErrDenied
 		}
 	case modeExplicitNone:
