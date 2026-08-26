@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -633,49 +635,91 @@ func TestC2a_SameKeyExpireReinsert(t *testing.T) {
 	}
 }
 
-// TestC2b_ConsumeDoesNotRangeLiveMap (R-2427 C2b durable proof): the op-count witness measures only
-// the heap loop, so a regression that adds `range r.consumed` ELSEWHERE in consume would not move it.
-// This is the mutation-discriminating guard: a source-AST assertion that the consume path
-// (replayStore.consume + its heap eviction helpers) contains NO range over the live map r.consumed —
-// the exact O(N) live-map scan the heap design removed. Adding such a range turns this test RED.
-func TestC2b_ConsumeDoesNotRangeLiveMap(t *testing.T) {
+// TestC2b_NoRangeOverLiveMapType (R-2427/R-2431/R-2432 + assurance ACK): the durable C2b guard. The
+// op-count witness measures only the heap loop, so a regression adding a live-map scan ELSEWHERE would
+// not move it. This is a TYPE-AWARE (go/types) prohibition: locate the replayStore.consumed field's
+// live-map type (map[replayKey]int64) and reject EVERY RangeStmt whose operand has that type. Keying
+// on the resolved TYPE — not a name/selector — covers direct selector, local alias, closure capture,
+// receiver/helper-name change, AND the free-helper-parameter flow (consume calling scanMap(r.consumed)
+// where scanMap ranges its map parameter), with no hand-built call graph. Non-vacuity is asserted so a
+// broken/aborted type-check cannot silently pass: the consumed field type resolves, an existing
+// r.consumed selector use resolves to it, and consume is located — none of which require a forbidden
+// range to exist.
+func TestC2b_NoRangeOverLiveMapType(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "warrant.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse warrant.go: %v", err)
 	}
-	guarded := map[string]bool{"consume": true, "heapPop": true, "heapPush": true}
-	seen := map[string]bool{}
-	ast.Inspect(f, func(n ast.Node) bool {
-		fn, ok := n.(*ast.FuncDecl)
-		if !ok || fn.Recv == nil || !guarded[fn.Name.Name] || !isReplayStoreReceiver(fn.Recv) {
-			return true
+	info := &types.Info{
+		Types: map[ast.Expr]types.TypeAndValue{},
+		Defs:  map[*ast.Ident]types.Object{},
+	}
+	conf := types.Config{
+		// Source importer resolves stdlib; the module-internal mint import may not resolve under
+		// srcimporter — Error collects and CONTINUES, and the in-package replayStore/replayKey/consumed
+		// types resolve regardless (they depend on no import).
+		Importer: importer.ForCompiler(fset, "source", nil),
+		Error:    func(error) {},
+	}
+	_, _ = conf.Check("github.com/bbmumford/warrant", fset, []*ast.File{f}, info)
+
+	// non-vacuity (1): the replayStore.consumed field type resolved to map[replayKey]int64.
+	var liveMap types.Type
+	for _, obj := range info.Defs {
+		if v, ok := obj.(*types.Var); ok && v != nil && v.IsField() && v.Name() == "consumed" {
+			liveMap = v.Type()
+			break
 		}
-		seen[fn.Name.Name] = true
-		ast.Inspect(fn.Body, func(m ast.Node) bool {
-			if rng, ok := m.(*ast.RangeStmt); ok {
-				if sel, ok := rng.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "consumed" {
-					t.Errorf("%s ranges over the live map r.consumed — the O(N) live-map scan C2b forbids", fn.Name.Name)
+	}
+	if liveMap == nil {
+		t.Fatal("non-vacuity: replayStore.consumed field type did not resolve — the type-aware guard is checking nothing")
+	}
+	mt, ok := liveMap.Underlying().(*types.Map)
+	if !ok {
+		t.Fatalf("consumed field is not a map type: %s", liveMap)
+	}
+	if named, ok := mt.Key().(*types.Named); !ok || named.Obj().Name() != "replayKey" {
+		t.Fatalf("consumed map key is not the named replayKey: %s", mt.Key())
+	}
+	if b, ok := mt.Elem().(*types.Basic); !ok || b.Kind() != types.Int64 {
+		t.Fatalf("consumed map value is not int64: %s", mt.Elem())
+	}
+
+	// non-vacuity (2)+(3): an existing `.consumed` selector use resolves to the live-map type, and
+	// consume is located.
+	selectorResolved, consumeFound := false, false
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.FuncDecl:
+			if x.Name.Name == "consume" {
+				consumeFound = true
+			}
+		case *ast.SelectorExpr:
+			if x.Sel.Name == "consumed" {
+				if tv, ok := info.Types[x]; ok && tv.Type != nil && types.Identical(tv.Type, liveMap) {
+					selectorResolved = true
 				}
 			}
-			return true
-		})
+		}
 		return true
 	})
-	// Guard the guard: a rename of consume must not silently disable this check.
-	if !seen["consume"] {
-		t.Fatal("did not find *replayStore.consume to inspect — the AST guard checks nothing")
+	if !consumeFound {
+		t.Fatal("non-vacuity: replayStore.consume not found")
 	}
-}
+	if !selectorResolved {
+		t.Fatal("non-vacuity: no existing r.consumed selector use resolved to the live-map type — type info is incomplete")
+	}
 
-func isReplayStoreReceiver(recv *ast.FieldList) bool {
-	if recv == nil || len(recv.List) != 1 {
-		return false
-	}
-	star, ok := recv.List[0].Type.(*ast.StarExpr)
-	if !ok {
-		return false
-	}
-	id, ok := star.X.(*ast.Ident)
-	return ok && id.Name == "replayStore"
+	// the guard: reject every range whose operand type is identical to the live-map type.
+	ast.Inspect(f, func(n ast.Node) bool {
+		rng, ok := n.(*ast.RangeStmt)
+		if !ok {
+			return true
+		}
+		if tv, ok := info.Types[rng.X]; ok && tv.Type != nil && types.Identical(tv.Type, liveMap) {
+			t.Errorf("range over the live-map type map[replayKey]int64 at %s — the O(N) live-map scan C2b forbids (any form: selector, alias, or helper parameter)", fset.Position(rng.Pos()))
+		}
+		return true
+	})
 }
