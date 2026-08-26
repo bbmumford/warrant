@@ -588,3 +588,44 @@ func TestC2_EvictionInspectionsIndependentOfLiveSet(t *testing.T) {
 		t.Fatalf("inspections must scale with the EXPIRED set (500)+1, not the live set; got %d", got)
 	}
 }
+
+// TestC2a_HeapPopZerosVacatedSlot (assurance C2a): heapPop must zero the vacated backing-array slot,
+// so a popped entry's replayKey strings are GC-reclaimable rather than retained until a later push
+// overwrites the index. After a spike of expiring entries drains, every backing slot beyond the live
+// length up to cap must be the zero replayEntry.
+func TestC2a_HeapPopZerosVacatedSlot(t *testing.T) {
+	r := newReplayStore()
+	for i := 0; i < 100; i++ { // spike, all expire at 100
+		r.consume(replayKey{issuer, aud, ver, homeRealm, fmt.Sprintf("spike-%d", i)}, 100, 10)
+	}
+	r.consume(replayKey{issuer, aud, ver, homeRealm, "drain"}, 1_000_000, 200) // now=200 pops all 100
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	full := r.heap[:cap(r.heap)]
+	for i := len(r.heap); i < len(full); i++ {
+		if full[i] != (replayEntry{}) {
+			t.Fatalf("backing slot %d retains a popped entry %+v — heapPop must zero it for reclamation", i, full[i])
+		}
+	}
+}
+
+// TestC2a_SameKeyExpireReinsert (assurance C2a invariant): a live second use is denied (replay);
+// after expiry the SAME key re-admits as a fresh assertion with its new expiry; map/heap stay 1:1.
+func TestC2a_SameKeyExpireReinsert(t *testing.T) {
+	r := newReplayStore()
+	k := replayKey{issuer, aud, ver, homeRealm, "reused"}
+	if !r.consume(k, 100, 10) {
+		t.Fatal("first use must admit")
+	}
+	if r.consume(k, 100, 50) {
+		t.Fatal("a live second use of the same key must be DENIED (replay)")
+	}
+	if !r.consume(k, 1_000, 200) { // now=200 > 100: prior expired → reclaimed → re-admits
+		t.Fatal("after expiry the same key must re-admit with its new assertion")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.consumed[k] != 1_000 || len(r.consumed) != 1 || len(r.heap) != 1 {
+		t.Fatalf("map/heap must be 1:1 with the reinserted expiry; map[k]=%d len(map)=%d len(heap)=%d", r.consumed[k], len(r.consumed), len(r.heap))
+	}
+}

@@ -339,6 +339,10 @@ func (r *replayStore) heapPop() replayEntry {
 	n := len(r.heap) - 1
 	top := r.heap[0]
 	r.heap[0] = r.heap[n]
+	// Zero the vacated tail slot before reslicing: the popped entry's replayKey strings would
+	// otherwise stay referenced by the backing array until a later push overwrites the index, so at
+	// low post-spike traffic the memory an expired nonce holds is not reclaimed though it is evicted.
+	r.heap[n] = replayEntry{}
 	r.heap = r.heap[:n]
 	for i := 0; ; {
 		l, rr, smallest := 2*i+1, 2*i+2, i
