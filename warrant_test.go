@@ -678,8 +678,8 @@ func TestC2b_ObjectIdentityWhitelist(t *testing.T) {
 	if _, ok := realFiles["warrant.go"]; !ok {
 		t.Fatal("discovery non-vacuity: warrant.go not found in the root package production set")
 	}
-	fset, files, info := c2bTypeCheck(t, realFiles)
-	field := c2bResolveField(info)
+	fset, files, info, pkg := c2bTypeCheck(t, realFiles)
+	field := c2bResolveField(pkg)
 	if field == nil {
 		t.Fatal("non-vacuity: the replayStore.consumed field object did not resolve — the guard is checking nothing")
 	}
@@ -713,10 +713,17 @@ func (r *replayStore) consume() { for range replayMap(r.consumed) { } }`)}},
 			"warrant.go": c2bBase("", `type replayIndex map[replayKey]int64
 func (r *replayStore) consume() { var live replayIndex = r.consumed; live.scan() }`),
 			"replayindex.go": "package warrant\nfunc (m replayIndex) scan() { for range m { } }\n"}},
+		// Seventh, discriminating control: a same-shaped consumed field on a DECOY struct (with fully
+		// admitted index/len/delete uses) must NOT let a forbidden bare use of the REAL replayStore.consumed
+		// pass. A resolver that scanned Defs by name/shape could bind the decoy field and miss the real one.
+		{"same-shaped-decoy-owner", map[string]string{
+			"warrant.go": c2bBase("", `type replayStoreDecoy struct { consumed map[replayKey]int64 }
+func (d *replayStoreDecoy) touch() { _ = d.consumed[replayKey("x")]; _ = len(d.consumed); delete(d.consumed, replayKey("x")) }
+func (r *replayStore) exposeConsumedForReview() map[replayKey]int64 { return r.consumed }`)}},
 	}
 	for _, mu := range mutants {
-		fs, fl, in := c2bTypeCheck(t, mu.files)
-		fld := c2bResolveField(in)
+		fs, fl, in, pk := c2bTypeCheck(t, mu.files)
+		fld := c2bResolveField(pk)
 		if fld == nil {
 			t.Errorf("[%s] the consumed field object did not resolve in the fixture", mu.name)
 			continue
@@ -735,8 +742,8 @@ func (r *replayStore) consume() { var live replayIndex = r.consumed; live.scan()
 func (r *replayStore) consume() { var live replayIndex = r.consumed; live.scan() }`),
 		"replayindex.go": "package warrant\nfunc (m replayIndex) scan() { for range m { } }\n",
 	}
-	bfset, bfiles, binfo := c2bTypeCheck(t, bypass)
-	bfield := c2bResolveField(binfo)
+	bfset, bfiles, binfo, bpkg := c2bTypeCheck(t, bypass)
+	bfield := c2bResolveField(bpkg)
 	if bfield == nil {
 		t.Fatal("[bypass] the consumed field object did not resolve")
 	}
@@ -774,7 +781,7 @@ func (r *replayStore) consume() { var live replayIndex = r.consumed; live.scan()
 // c2bTypeCheck parses the named source files as package warrant and type-checks them together. The
 // source importer resolves stdlib; any unresolvable in-module/generic import is collected and IGNORED
 // (Error continues), because the in-package replayStore/replayKey/consumed types resolve regardless.
-func c2bTypeCheck(t *testing.T, srcByName map[string]string) (*token.FileSet, []*ast.File, *types.Info) {
+func c2bTypeCheck(t *testing.T, srcByName map[string]string) (*token.FileSet, []*ast.File, *types.Info, *types.Package) {
 	t.Helper()
 	fset := token.NewFileSet()
 	names := make([]string, 0, len(srcByName))
@@ -796,29 +803,44 @@ func c2bTypeCheck(t *testing.T, srcByName map[string]string) (*token.FileSet, []
 		Uses:  map[*ast.Ident]types.Object{},
 	}
 	conf := types.Config{Importer: importer.ForCompiler(fset, "source", nil), Error: func(error) {}}
-	_, _ = conf.Check("github.com/bbmumford/warrant", fset, parsed, info)
-	return fset, parsed, info
+	pkg, _ := conf.Check("github.com/bbmumford/warrant", fset, parsed, info)
+	return fset, parsed, info, pkg
 }
 
-// c2bResolveField returns the exact replayStore.consumed field object (a map[replayKey]int64 field), or
-// nil. Identity is the field *types.Var, so a same-named field of a different type is not mistaken for it.
-func c2bResolveField(info *types.Info) *types.Var {
-	for _, obj := range info.Defs {
-		v, ok := obj.(*types.Var)
-		if !ok || v == nil || !v.IsField() || v.Name() != "consumed" {
+// c2bResolveField returns the field object OWNED BY replayStore named consumed, or nil. It resolves the
+// replayStore type from the package scope and selects that struct's own consumed field — it does NOT
+// scan arbitrary Defs by name/shape, so a same-shaped consumed field on a DIFFERENT struct can never be
+// mistaken for it (a nondeterministic-selection bypass). The shape (map[replayKey]int64) is validated
+// on replayStore's own field; a shape mismatch fails closed (nil).
+func c2bResolveField(pkg *types.Package) *types.Var {
+	if pkg == nil {
+		return nil
+	}
+	tn, ok := pkg.Scope().Lookup("replayStore").(*types.TypeName)
+	if !ok || tn == nil {
+		return nil
+	}
+	st, ok := tn.Type().Underlying().(*types.Struct)
+	if !ok {
+		return nil
+	}
+	for i := 0; i < st.NumFields(); i++ {
+		f := st.Field(i)
+		if f.Name() != "consumed" {
 			continue
 		}
-		m, ok := v.Type().Underlying().(*types.Map)
+		m, ok := f.Type().Underlying().(*types.Map)
 		if !ok {
-			continue
+			return nil
 		}
 		named, ok := m.Key().(*types.Named)
 		if !ok || named.Obj().Name() != "replayKey" {
-			continue
+			return nil
 		}
 		if b, ok := m.Elem().(*types.Basic); ok && b.Kind() == types.Int64 {
-			return v
+			return f
 		}
+		return nil
 	}
 	return nil
 }
