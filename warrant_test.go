@@ -9,6 +9,8 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -274,9 +276,9 @@ func TestNonce_MandatoryAndBounded(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
 	for name, n := range map[string]string{
-		"empty":   "",
-		"short":   "short",                                        // < minNonceLen(8)
-		"oversize": string(make([]byte, maxNonceLen+1)),           // > maxNonceLen
+		"empty":    "",
+		"short":    "short",                             // < minNonceLen(8)
+		"oversize": string(make([]byte, maxNonceLen+1)), // > maxNonceLen
 	} {
 		as := withNonce(baseAssertion(), n)
 		if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
@@ -635,95 +637,279 @@ func TestC2a_SameKeyExpireReinsert(t *testing.T) {
 	}
 }
 
-// TestC2b_NoRangeOverLiveMapType (R-2427/R-2431/R-2432 + assurance ACK): the durable C2b guard. The
-// op-count witness measures only the heap loop, so a regression adding a live-map scan ELSEWHERE would
-// not move it. This is a TYPE-AWARE (go/types) prohibition: locate the replayStore.consumed field's
-// live-map type (map[replayKey]int64) and reject EVERY RangeStmt whose operand has that type. Keying
-// on the resolved TYPE — not a name/selector — covers direct selector, local alias, closure capture,
-// receiver/helper-name change, AND the free-helper-parameter flow (consume calling scanMap(r.consumed)
-// where scanMap ranges its map parameter), with no hand-built call graph. Non-vacuity is asserted so a
-// broken/aborted type-check cannot silently pass: the consumed field type resolves, an existing
-// r.consumed selector use resolves to it, and consume is located — none of which require a forbidden
-// range to exist.
-func TestC2b_NoRangeOverLiveMapType(t *testing.T) {
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "warrant.go", nil, 0)
+// TestC2b_ObjectIdentityWhitelist is the durable C2b guard. C2b forbids any O(N) scan of the live
+// replay map replayStore.consumed (the op-count witness measures only the heap loop, so a scan added
+// ELSEWHERE would not move it). The guard closes the whole class at the SOURCE via go/types object
+// identity: it discovers and type-checks the COMPLETE non-test production set of the root package,
+// resolves the exact replayStore.consumed field object (a *types.Var — spelling/shadowing grants no
+// authority), and rejects EVERY selector use of that object except two safe positions — the X of an
+// index expression (r.consumed[k] read/write) and the first argument to the builtins len/delete
+// (resolved as *types.Builtin, not by name). Because every path to the map's value passes through such
+// a selector, this one rule closes direct range, alias/implicit assignment, helper/conversion
+// arguments, method-receiver escape, interface boxing and maps.Keys — including a mutation whose range
+// lives in a SECOND package file, which a single-file guard never parses. The underlying-range defense
+// is retained (a range whose operand's underlying type equals the live map's). A same-process
+// reflect/unsafe memory read is out of scope (a fundamental Go limit; consumers are first-party
+// endpoint code).
+//
+// Non-vacuity is asserted so an aborted type-check cannot silently pass: production-set discovery
+// includes warrant.go, the field object resolves, and the three whitelisted admissions (index, len,
+// delete) are each observed on clean source. Six independent mutant controls each turn the guard RED,
+// and the prior single-file range-only guard is shown GREEN on the cross-file bypass it could not see.
+func TestC2b_ObjectIdentityWhitelist(t *testing.T) {
+	// (A) CLEAN real package: discover + type-check the complete non-test production set.
+	realFiles := map[string]string{}
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse warrant.go: %v", err)
+		t.Fatalf("read package dir: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		realFiles[name] = string(b)
+	}
+	// discovery non-vacuity: the production set includes warrant.go.
+	if _, ok := realFiles["warrant.go"]; !ok {
+		t.Fatal("discovery non-vacuity: warrant.go not found in the root package production set")
+	}
+	fset, files, info := c2bTypeCheck(t, realFiles)
+	field := c2bResolveField(info)
+	if field == nil {
+		t.Fatal("non-vacuity: the replayStore.consumed field object did not resolve — the guard is checking nothing")
+	}
+	viol, idx, lenA, delA := c2bAnalyze(fset, files, info, field)
+	if len(viol) != 0 {
+		t.Fatalf("clean source must be GREEN (0 violations); got: %v", viol)
+	}
+	// admission non-vacuity: index, len, and delete are each observed independently on clean source.
+	if idx == 0 || lenA == 0 || delA == 0 {
+		t.Fatalf("admission non-vacuity failed (each must be >=1): index=%d len=%d delete=%d", idx, lenA, delA)
+	}
+
+	// (B) SIX mutant controls: each independent bypass must turn the successor guard RED (>=1 violation).
+	mutants := []struct {
+		name  string
+		files map[string]string
+	}{
+		{"direct-selector-range", map[string]string{
+			"warrant.go": c2bBase("", `func (r *replayStore) consume() { for range r.consumed { _ = r } }`)}},
+		{"free-helper-parameter", map[string]string{
+			"warrant.go": c2bBase("", `func scanMap(m map[replayKey]int64) { for range m { } }
+func (r *replayStore) consume() { scanMap(r.consumed) }`)}},
+		{"plain-alias", map[string]string{
+			"warrant.go": c2bBase("", `func (r *replayStore) consume() { m := r.consumed; for range m { } }`)}},
+		{"named-wrapper-conversion", map[string]string{
+			"warrant.go": c2bBase("", `type replayMap map[replayKey]int64
+func (r *replayStore) consume() { for range replayMap(r.consumed) { } }`)}},
+		{"maps-keys-iterator", map[string]string{
+			"warrant.go": c2bBase(`"maps"`, `func (r *replayStore) consume() { for range maps.Keys(r.consumed) { } }`)}},
+		{"implicit-assign-crossfile", map[string]string{
+			"warrant.go": c2bBase("", `type replayIndex map[replayKey]int64
+func (r *replayStore) consume() { var live replayIndex = r.consumed; live.scan() }`),
+			"replayindex.go": "package warrant\nfunc (m replayIndex) scan() { for range m { } }\n"}},
+	}
+	for _, mu := range mutants {
+		fs, fl, in := c2bTypeCheck(t, mu.files)
+		fld := c2bResolveField(in)
+		if fld == nil {
+			t.Errorf("[%s] the consumed field object did not resolve in the fixture", mu.name)
+			continue
+		}
+		mv, _, _, _ := c2bAnalyze(fs, fl, in, fld)
+		if len(mv) == 0 {
+			t.Errorf("[%s] mutant must be RED under the successor guard, but no violation was detected", mu.name)
+		}
+	}
+
+	// (C) The sixth (cross-file) control, examined directly: prove the second production file
+	// participates in the SAME type-check, that the OLD single-file range-only guard is GREEN on it (the
+	// gap), and that the successor guard is RED.
+	bypass := map[string]string{
+		"warrant.go": c2bBase("", `type replayIndex map[replayKey]int64
+func (r *replayStore) consume() { var live replayIndex = r.consumed; live.scan() }`),
+		"replayindex.go": "package warrant\nfunc (m replayIndex) scan() { for range m { } }\n",
+	}
+	bfset, bfiles, binfo := c2bTypeCheck(t, bypass)
+	bfield := c2bResolveField(binfo)
+	if bfield == nil {
+		t.Fatal("[bypass] the consumed field object did not resolve")
+	}
+	// second-file participation: the scan method declared in replayindex.go resolved in this type-check.
+	secondFileSeen := false
+	for id, obj := range binfo.Defs {
+		if id != nil && id.Name == "scan" {
+			if _, ok := obj.(*types.Func); ok {
+				secondFileSeen = true
+			}
+		}
+	}
+	if !secondFileSeen {
+		t.Fatal("[bypass] sixth-control non-vacuity: the second production file did not participate in the same type-check")
+	}
+	// old single-file range-only guard over ONLY warrant.go: GREEN, because the range is in the other file.
+	var warrantFile *ast.File
+	for _, f := range bfiles {
+		if strings.HasSuffix(bfset.Position(f.Pos()).Filename, "warrant.go") {
+			warrantFile = f
+		}
+	}
+	if warrantFile == nil {
+		t.Fatal("[bypass] could not locate the warrant.go fixture file")
+	}
+	if n := c2bRangeOnly(bfset, warrantFile, binfo, bfield.Type().Underlying()); n != 0 {
+		t.Fatalf("[bypass] old single-file range-only guard must be GREEN on warrant.go (the gap R-2435 proved); got %d range violations", n)
+	}
+	// successor guard over BOTH files: RED (it flags the alias site AND the cross-file range).
+	if bv, _, _, _ := c2bAnalyze(bfset, bfiles, binfo, bfield); len(bv) == 0 {
+		t.Fatal("[bypass] successor guard must be RED on the R-2435 cross-file bypass")
+	}
+}
+
+// c2bTypeCheck parses the named source files as package warrant and type-checks them together. The
+// source importer resolves stdlib; any unresolvable in-module/generic import is collected and IGNORED
+// (Error continues), because the in-package replayStore/replayKey/consumed types resolve regardless.
+func c2bTypeCheck(t *testing.T, srcByName map[string]string) (*token.FileSet, []*ast.File, *types.Info) {
+	t.Helper()
+	fset := token.NewFileSet()
+	names := make([]string, 0, len(srcByName))
+	for n := range srcByName {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var parsed []*ast.File
+	for _, name := range names {
+		f, err := parser.ParseFile(fset, name, srcByName[name], 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		parsed = append(parsed, f)
 	}
 	info := &types.Info{
 		Types: map[ast.Expr]types.TypeAndValue{},
 		Defs:  map[*ast.Ident]types.Object{},
+		Uses:  map[*ast.Ident]types.Object{},
 	}
-	conf := types.Config{
-		// Source importer resolves stdlib; the module-internal mint import may not resolve under
-		// srcimporter — Error collects and CONTINUES, and the in-package replayStore/replayKey/consumed
-		// types resolve regardless (they depend on no import).
-		Importer: importer.ForCompiler(fset, "source", nil),
-		Error:    func(error) {},
-	}
-	_, _ = conf.Check("github.com/bbmumford/warrant", fset, []*ast.File{f}, info)
+	conf := types.Config{Importer: importer.ForCompiler(fset, "source", nil), Error: func(error) {}}
+	_, _ = conf.Check("github.com/bbmumford/warrant", fset, parsed, info)
+	return fset, parsed, info
+}
 
-	// non-vacuity (1): the replayStore.consumed field type resolved to map[replayKey]int64.
-	var liveMap types.Type
+// c2bResolveField returns the exact replayStore.consumed field object (a map[replayKey]int64 field), or
+// nil. Identity is the field *types.Var, so a same-named field of a different type is not mistaken for it.
+func c2bResolveField(info *types.Info) *types.Var {
 	for _, obj := range info.Defs {
-		if v, ok := obj.(*types.Var); ok && v != nil && v.IsField() && v.Name() == "consumed" {
-			liveMap = v.Type()
-			break
+		v, ok := obj.(*types.Var)
+		if !ok || v == nil || !v.IsField() || v.Name() != "consumed" {
+			continue
+		}
+		m, ok := v.Type().Underlying().(*types.Map)
+		if !ok {
+			continue
+		}
+		named, ok := m.Key().(*types.Named)
+		if !ok || named.Obj().Name() != "replayKey" {
+			continue
+		}
+		if b, ok := m.Elem().(*types.Basic); ok && b.Kind() == types.Int64 {
+			return v
 		}
 	}
-	if liveMap == nil {
-		t.Fatal("non-vacuity: replayStore.consumed field type did not resolve — the type-aware guard is checking nothing")
-	}
-	mt, ok := liveMap.Underlying().(*types.Map)
-	if !ok {
-		t.Fatalf("consumed field is not a map type: %s", liveMap)
-	}
-	if named, ok := mt.Key().(*types.Named); !ok || named.Obj().Name() != "replayKey" {
-		t.Fatalf("consumed map key is not the named replayKey: %s", mt.Key())
-	}
-	if b, ok := mt.Elem().(*types.Basic); !ok || b.Kind() != types.Int64 {
-		t.Fatalf("consumed map value is not int64: %s", mt.Elem())
-	}
+	return nil
+}
 
-	// non-vacuity (2)+(3): an existing `.consumed` selector use resolves to the live-map type, and
-	// consume is located.
-	selectorResolved, consumeFound := false, false
-	ast.Inspect(f, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.FuncDecl:
-			if x.Name.Name == "consume" {
-				consumeFound = true
+// c2bAnalyze reports every non-whitelisted use of the consumed field object across all files, plus any
+// retained underlying-range violation, and counts the three whitelisted admission forms observed
+// (index, len, delete) for non-vacuity. A selector use is admitted only as the X of an index expression
+// or the first argument to the go/types-resolved builtins len/delete; everything else — assignment,
+// conversion, non-builtin call argument, address-of, bare use — is a violation.
+func c2bAnalyze(fset *token.FileSet, files []*ast.File, info *types.Info, field *types.Var) (viol []string, idx, lenA, delA int) {
+	liveUnder := field.Type().Underlying()
+	builtinName := func(call *ast.CallExpr) string {
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return ""
+		}
+		if b, ok := info.Uses[id].(*types.Builtin); ok {
+			return b.Name()
+		}
+		return ""
+	}
+	for _, f := range files {
+		var stack []ast.Node
+		ast.Inspect(f, func(n ast.Node) bool {
+			if n == nil {
+				stack = stack[:len(stack)-1]
+				return true
 			}
-		case *ast.SelectorExpr:
-			if x.Sel.Name == "consumed" {
-				if tv, ok := info.Types[x]; ok && tv.Type != nil && types.Identical(tv.Type, liveMap) {
-					selectorResolved = true
+			var parent ast.Node
+			if len(stack) > 0 {
+				parent = stack[len(stack)-1]
+			}
+			switch x := n.(type) {
+			case *ast.RangeStmt:
+				if tv, ok := info.Types[x.X]; ok && tv.Type != nil && types.Identical(tv.Type.Underlying(), liveUnder) {
+					viol = append(viol, "range over the live-map underlying type at "+fset.Position(x.Pos()).String())
+				}
+			case *ast.SelectorExpr:
+				if info.Uses[x.Sel] == field {
+					switch p := parent.(type) {
+					case *ast.IndexExpr:
+						if p.X == x {
+							idx++ // r.consumed[k] read/write — admitted
+						} else {
+							viol = append(viol, "consumed used as an index key at "+fset.Position(x.Pos()).String())
+						}
+					case *ast.CallExpr:
+						if len(p.Args) > 0 && p.Args[0] == x && (builtinName(p) == "len" || builtinName(p) == "delete") {
+							if builtinName(p) == "len" {
+								lenA++
+							} else {
+								delA++
+							}
+						} else {
+							viol = append(viol, "consumed passed to a non-whitelisted callee at "+fset.Position(x.Pos()).String())
+						}
+					default:
+						viol = append(viol, "non-whitelisted use of replayStore.consumed at "+fset.Position(x.Pos()).String())
+					}
 				}
 			}
-		}
-		return true
-	})
-	if !consumeFound {
-		t.Fatal("non-vacuity: replayStore.consume not found")
-	}
-	if !selectorResolved {
-		t.Fatal("non-vacuity: no existing r.consumed selector use resolved to the live-map type — type info is incomplete")
-	}
-
-	// the guard: reject every range whose operand's UNDERLYING type is identical to the live-map's
-	// underlying type. Comparing underlyings (not the operand type itself) also catches a NAMED wrapper
-	// — `type replayMap map[replayKey]int64; range replayMap(r.consumed)` — whose underlying is the same
-	// map[replayKey]int64 but which is not types.Identical to the unnamed field type.
-	liveUnder := liveMap.Underlying()
-	ast.Inspect(f, func(n ast.Node) bool {
-		rng, ok := n.(*ast.RangeStmt)
-		if !ok {
+			stack = append(stack, n)
 			return true
-		}
-		if tv, ok := info.Types[rng.X]; ok && tv.Type != nil && types.Identical(tv.Type.Underlying(), liveUnder) {
-			t.Errorf("range over the live-map type map[replayKey]int64 at %s — the O(N) live-map scan C2b forbids (any form: selector, alias, helper parameter, or named wrapper)", fset.Position(rng.Pos()))
+		})
+	}
+	return
+}
+
+// c2bRangeOnly is the prior single-file range-only guard, retained solely to demonstrate the gap the
+// object-identity successor closes: it counts only ranges over the live-map underlying type in ONE file.
+func c2bRangeOnly(fset *token.FileSet, f *ast.File, info *types.Info, liveUnder types.Type) int {
+	n := 0
+	ast.Inspect(f, func(node ast.Node) bool {
+		if rng, ok := node.(*ast.RangeStmt); ok {
+			if tv, ok := info.Types[rng.X]; ok && tv.Type != nil && types.Identical(tv.Type.Underlying(), liveUnder) {
+				n++
+			}
 		}
 		return true
 	})
+	return n
+}
+
+// c2bBase builds a minimal package-warrant fixture: replayKey + replayStore.consumed + the given body,
+// with an optional import (e.g. `"maps"`).
+func c2bBase(imp, body string) string {
+	head := "package warrant\n"
+	if imp != "" {
+		head += "import " + imp + "\n"
+	}
+	head += "type replayKey string\n"
+	head += "type replayStore struct { consumed map[replayKey]int64 }\n"
+	return head + body + "\n"
 }
