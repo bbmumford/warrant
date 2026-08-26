@@ -280,6 +280,11 @@ type replayStore struct {
 	consumed   map[replayKey]int64 // key → assertion expiry (ms); only LIVE entries survive a consume
 	heap       []replayEntry       // min-heap by expiry: bounded eviction, never a full live-set scan
 	maxEntries int
+	// evictInspections counts entries the eviction step inspected (heap-root peeks). It is an
+	// operation-count witness: per consume it is O(expired)+1, INDEPENDENT of the live-set size, so a
+	// test can prove eviction never ranges over all live entries (a regression to a full-map scan
+	// would make it O(live)). Not part of the authority decision.
+	evictInspections int64
 }
 
 func newReplayStore() *replayStore {
@@ -294,7 +299,11 @@ func newReplayStore() *replayStore {
 func (r *replayStore) consume(key replayKey, expiryMS, nowMS int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for len(r.heap) > 0 && r.heap[0].expiry <= nowMS {
+	for len(r.heap) > 0 {
+		r.evictInspections++ // inspect the root only; O(expired)+1 per consume, never O(live)
+		if r.heap[0].expiry > nowMS {
+			break
+		}
 		e := r.heapPop()
 		// Lazy 1:1 delete: drop the map entry only for the same insertion this heap node recorded.
 		if cur, ok := r.consumed[e.key]; ok && cur == e.expiry {
@@ -480,19 +489,12 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	if principal.Realm() != route.required.Realm() {
 		return Identity{}, ErrDenied
 	}
-	// (4) ONE authoritative decision instant, sampled ONCE here — after every non-time authority
-	// check (seal, subject, tenant, representation, nonce, route, realm) and before both the trust/
-	// expiry admission and the replay consume below, which now share it. A single monotonic read per
-	// decision closes the two-sample gap: previously trustAccepts read the clock and consume read it
-	// again, so a principal could pass admission at the first instant and be consumed — inserting an
-	// already-expired replay entry — after crossing expiry at the second. monoClock keeps it
-	// rollback-safe, and trustAccepts denies at now >= ExpiresAtMS (exact-expiry).
-	nowMS := a.mono.now()
-	if !a.trustAccepts(principal, nowMS) {
-		return Identity{}, ErrDenied
-	}
-	// (5) sealed capabilities parsed here (never caller-authored); a malformed grant denies. Every
-	// capability MUST be in the principal's realm (assurance HOLD 1) — no cross-realm capability.
+	// (4) sealed capabilities parsed here (never caller-authored); a malformed grant denies. Every
+	// capability MUST be in the principal's realm (assurance HOLD 1) — no cross-realm capability. This
+	// and the owner/global binding below are DETERMINISTIC (no clock), so they run BEFORE the single
+	// time sample: a malformed/unmet-capability or wrong-owner denial reads the clock ZERO times, and
+	// only a decision that has passed EVERY deterministic authority check reaches the clock — so no
+	// capability-bundle work can age the decision instant between admission and consume.
 	caps := make([]Capability, 0, len(principal.Capabilities()))
 	for _, s := range principal.Capabilities() {
 		c, err := ParseCapability(s)
@@ -525,8 +527,18 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	default:
 		return Identity{}, ErrDenied
 	}
-	// (6) atomic replay consume LAST — the nonce is mandatory (checked at 2b), so every request is
-	// exactly-once. A failed check above never reaches here, so it cannot poison the nonce; two
+	// (5) ONE authoritative decision instant, sampled EXACTLY ONCE here — after every DETERMINISTIC
+	// authority check above (seal, subject, tenant, representation, nonce, route, realm, capability,
+	// owner/global) and immediately before the two time-dependent steps, which share it. A single
+	// monotonic read per decision: a deterministic denial never reads the clock, and nothing between
+	// admission and consume can age the instant. monoClock keeps it rollback-safe; trustAccepts denies
+	// at now >= ExpiresAtMS (exact-expiry).
+	nowMS := a.mono.now()
+	if !a.trustAccepts(principal, nowMS) {
+		return Identity{}, ErrDenied
+	}
+	// (6) atomic replay consume LAST — after every prior check INCLUDING trust, so a failed check
+	// never poisons the nonce; the nonce is mandatory (2b) so every request is exactly-once, and two
 	// concurrent identical uses yield exactly one success. Typed key, expiry-bounded storage.
 	key := replayKey{principal.Issuer(), principal.Audience(), principal.Version(), principal.Realm(), principal.Nonce()}
 	if !a.replay.consume(key, principal.ExpiresAtMS(), nowMS) {

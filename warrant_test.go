@@ -510,3 +510,81 @@ func TestC2_LargeLiveSetDoesNotEvictUnexpired(t *testing.T) {
 		t.Fatalf("no live entry may be evicted; map=%d heap=%d want %d", len(r.consumed), len(r.heap), n+1)
 	}
 }
+
+// TestC1_DeterministicDenialsReadClockZeroTimes (R-2426 C1 placement): every deterministic authority
+// denial — malformed/unmet/cross-realm capability, wrong owner, global owner-material — is decided
+// BEFORE the single time sample, so it reads the clock ZERO times; only a decision that has passed
+// every deterministic check reaches the clock, and a valid one reads it EXACTLY once. A counting
+// clock is the discriminator the pre-reorder code (which sampled before capability/owner) fails.
+func TestC1_DeterministicDenialsReadClockZeroTimes(t *testing.T) {
+	v, _ := NewVerifier()
+	var reads int64
+	clock := func() int64 { atomic.AddInt64(&reads, 1); return 5000 }
+	a := newAuthz(t, v, clock)
+
+	cases := []struct {
+		name   string
+		mutate func(*Assertion)
+		op     OperationID
+		body   string
+	}{
+		{"malformed-capability", func(as *Assertion) { as.Capabilities = []string{"not-a-capability"}; as.Nonce = "n-c1-malcap" }, "device.read", "acme"},
+		{"unmet-capability", func(as *Assertion) { as.Nonce = "n-c1-unmet" }, "device.admin", "acme"}, // read cap on admin route
+		{"cross-realm-capability", func(as *Assertion) { as.Capabilities = []string{"orbtr.ai:device.read"}; as.Nonce = "n-c1-xrealm" }, "device.read", "acme"},
+		{"wrong-owner", func(as *Assertion) { as.Nonce = "n-c1-wrongowner" }, "device.read", "evil"},
+		{"global-owner-material", func(as *Assertion) { as.Capabilities = []string{"orbtr.io:tuf.get"}; as.Nonce = "n-c1-globalowner" }, "tuf.get", ""},
+	}
+	for _, c := range cases {
+		as := baseAssertion()
+		c.mutate(&as)
+		atomic.StoreInt64(&reads, 0)
+		if _, err := a.Authorize(context.Background(), mustMint(t, v, as), c.op, c.body); !denied(err) {
+			t.Fatalf("%s must be DENIED", c.name)
+		}
+		if n := atomic.LoadInt64(&reads); n != 0 {
+			t.Fatalf("%s is a deterministic denial and must read the clock ZERO times; got %d", c.name, n)
+		}
+	}
+
+	atomic.StoreInt64(&reads, 0)
+	if _, err := a.Authorize(context.Background(), mustMint(t, v, withNonce(baseAssertion(), "n-c1-valid")), "device.read", "acme"); err != nil {
+		t.Fatalf("valid decision should succeed; got %v", err)
+	}
+	if n := atomic.LoadInt64(&reads); n != 1 {
+		t.Fatalf("a valid decision must read the clock EXACTLY once; got %d", n)
+	}
+}
+
+// TestC2_EvictionInspectionsIndependentOfLiveSet (R-2426 C2 proof): the operation-count witness. A
+// consume with nothing expired inspects only the heap root — ONE inspection — regardless of live-set
+// size. A regression to a full live-map range would make the count scale with N; length-only
+// assertions could not tell the difference.
+func TestC2_EvictionInspectionsIndependentOfLiveSet(t *testing.T) {
+	measure := func(n int) int64 {
+		r := newReplayStore()
+		for i := 0; i < n; i++ {
+			r.consume(replayKey{issuer, aud, ver, homeRealm, fmt.Sprintf("live-%d", i)}, 1_000_000, 1000)
+		}
+		before := r.evictInspections
+		r.consume(replayKey{issuer, aud, ver, homeRealm, "probe"}, 1_000_000, 1000) // nothing expired
+		return r.evictInspections - before
+	}
+	small, large := measure(1_000), measure(50_000)
+	if small != 1 || large != 1 {
+		t.Fatalf("eviction cost must be independent of live-set size (root-only when nothing expired); small=%d large=%d", small, large)
+	}
+	// control: with k entries expired at nowMS, inspections scale with k (the reclaimed set), not N.
+	r := newReplayStore()
+	for i := 0; i < 500; i++ { // expire at 100
+		r.consume(replayKey{issuer, aud, ver, homeRealm, fmt.Sprintf("exp-%d", i)}, 100, 10)
+	}
+	for i := 0; i < 5_000; i++ { // live far out
+		r.consume(replayKey{issuer, aud, ver, homeRealm, fmt.Sprintf("live-%d", i)}, 1_000_000, 10)
+	}
+	before := r.evictInspections
+	r.consume(replayKey{issuer, aud, ver, homeRealm, "probe2"}, 1_000_000, 200) // now=200 → the 500 expire
+	got := r.evictInspections - before
+	if got != 501 { // 500 expired popped + 1 final root peek; independent of the 5000 live
+		t.Fatalf("inspections must scale with the EXPIRED set (500)+1, not the live set; got %d", got)
+	}
+}
