@@ -711,14 +711,18 @@ func TestC2b_NoRangeOverLiveMapType(t *testing.T) {
 		t.Fatal("non-vacuity: no existing r.consumed selector use resolved to the live-map type — type info is incomplete")
 	}
 
-	// the guard: reject every range whose operand type is identical to the live-map type.
+	// the guard: reject every range whose operand's UNDERLYING type is identical to the live-map's
+	// underlying type. Comparing underlyings (not the operand type itself) also catches a NAMED wrapper
+	// — `type replayMap map[replayKey]int64; range replayMap(r.consumed)` — whose underlying is the same
+	// map[replayKey]int64 but which is not types.Identical to the unnamed field type.
+	liveUnder := liveMap.Underlying()
 	ast.Inspect(f, func(n ast.Node) bool {
 		rng, ok := n.(*ast.RangeStmt)
 		if !ok {
 			return true
 		}
-		if tv, ok := info.Types[rng.X]; ok && tv.Type != nil && types.Identical(tv.Type, liveMap) {
-			t.Errorf("range over the live-map type map[replayKey]int64 at %s — the O(N) live-map scan C2b forbids (any form: selector, alias, or helper parameter)", fset.Position(rng.Pos()))
+		if tv, ok := info.Types[rng.X]; ok && tv.Type != nil && types.Identical(tv.Type.Underlying(), liveUnder) {
+			t.Errorf("range over the live-map type map[replayKey]int64 at %s — the O(N) live-map scan C2b forbids (any form: selector, alias, helper parameter, or named wrapper)", fset.Position(rng.Pos()))
 		}
 		return true
 	})
