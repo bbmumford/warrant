@@ -139,24 +139,24 @@ func (s CapabilitySet) Subsumes(other CapabilitySet) bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OwnerScope — server-established {realm, owner}. No exported constructor: minted only
+// Partition — server-established {realm, owner}. No exported constructor: minted only
 // inside Authorize from the SEALED owner, so a handler can only RECEIVE one.
 // ─────────────────────────────────────────────────────────────────────────────
 
-type OwnerScope struct {
+type Partition struct {
 	realm string
 	owner string
 }
 
-func newOwnerScope(realm, owner string) OwnerScope { return OwnerScope{realm: realm, owner: owner} }
+func newPartition(realm, owner string) Partition { return Partition{realm: realm, owner: owner} }
 
-func (o OwnerScope) Realm() string { return o.realm }
-func (o OwnerScope) Owner() string { return o.owner }
+func (o Partition) Realm() string     { return o.realm }
+func (o Partition) Partition() string { return o.owner }
 
 // IsZero denies unless BOTH realm and owner are non-empty (a partial scope is not a partition).
-func (o OwnerScope) IsZero() bool { return o.realm == "" || o.owner == "" }
+func (o Partition) IsZero() bool { return o.realm == "" || o.owner == "" }
 
-func (o OwnerScope) Equal(x OwnerScope) bool { return o.realm == x.realm && o.owner == x.owner }
+func (o Partition) Equal(x Partition) bool { return o.realm == x.realm && o.owner == x.owner }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Route — closed sum, keyed by SERVER operation identity (R-2411 pin 2). The Authorizer
@@ -171,7 +171,7 @@ type routeMode int
 
 const (
 	modeInvalid routeMode = iota
-	modeOwnerBound
+	modePartitionBound
 	modeGlobal
 )
 
@@ -181,13 +181,13 @@ type Route struct {
 	required Capability
 }
 
-// OwnerBoundRoute: a per-owner op; the resolved OwnerScope's realm equals the capability's
+// PartitionBoundRoute: a per-owner op; the resolved Partition's realm equals the capability's
 // realm, and the sealed owner must equal the op's body owner.
-func OwnerBoundRoute(op OperationID, required Capability) (Route, error) {
+func PartitionBoundRoute(op OperationID, required Capability) (Route, error) {
 	if op == "" || required.IsZero() {
 		return Route{}, ErrDenied
 	}
-	return Route{op: op, mode: modeOwnerBound, required: required}, nil
+	return Route{op: op, mode: modePartitionBound, required: required}, nil
 }
 
 // GlobalRoute: a genuinely owner-less op; rejects any owner-bearing principal.
@@ -364,7 +364,7 @@ func (r *replayStore) heapPop() replayEntry {
 // Identity is what a handler receives from a successful Authorize.
 type Identity struct {
 	Subject      Subject
-	OwnerScope   OwnerScope // zero for a Global route
+	Partition    Partition // zero for a Global route
 	Capabilities CapabilitySet
 }
 
@@ -510,16 +510,16 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	held := NewCapabilitySet(caps...)
 	id := Identity{Subject: principal.Subject(), Capabilities: held}
 	switch route.mode {
-	case modeOwnerBound:
+	case modePartitionBound:
 		owner := principal.Owner()
 		if !principal.HasOwner() || !validOwner(owner) || owner != bodyOwner {
 			return Identity{}, ErrDenied
 		}
-		os := newOwnerScope(route.required.Realm(), owner)
+		os := newPartition(route.required.Realm(), owner)
 		if os.IsZero() || !held.Allows(route.required) {
 			return Identity{}, ErrDenied
 		}
-		id.OwnerScope = os
+		id.Partition = os
 	case modeGlobal:
 		// global routes deny ANY owner material (assurance HOLD 4).
 		if principal.HasOwner() || principal.Owner() != "" || bodyOwner != "" {

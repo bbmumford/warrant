@@ -72,7 +72,7 @@ func main() {
 
 	home := warrant.RealmTrust{Realm: "orbtr.io", Issuer: "io-edge", Audience: "node.orbtr.io", PolicyVersion: "v1", ExpiresAtMS: 1 << 62}
 	reqCap, _ := warrant.ParseCapability("orbtr.io:device.read")
-	route, _ := warrant.OwnerBoundRoute("device.read", reqCap)
+	route, _ := warrant.PartitionBoundRoute("device.read", reqCap)
 	clock := func() int64 { return 5000 }
 
 	realAz, _ := warrant.NewAuthorizer(real, "orbtr", clock, []warrant.Route{route}, home)

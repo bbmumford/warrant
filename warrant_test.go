@@ -42,11 +42,11 @@ func fixedClock(now int64) Clock { return func() int64 { return now } }
 
 func routes(t *testing.T) []Route {
 	t.Helper()
-	rRead, err := OwnerBoundRoute("device.read", mustCap(t, "orbtr.io:device.read"))
+	rRead, err := PartitionBoundRoute("device.read", mustCap(t, "orbtr.io:device.read"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rAdmin, err := OwnerBoundRoute("device.admin", mustCap(t, "orbtr.io:device.admin"))
+	rAdmin, err := PartitionBoundRoute("device.admin", mustCap(t, "orbtr.io:device.admin"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +121,8 @@ func TestOwnerBound_Positive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid owner-bound request should succeed; got %v", err)
 	}
-	if id.OwnerScope.Realm() != homeRealm || id.OwnerScope.Owner() != "acme" {
-		t.Fatalf("wrong OwnerScope: %+v", id.OwnerScope)
+	if id.Partition.Realm() != homeRealm || id.Partition.Partition() != "acme" {
+		t.Fatalf("wrong Partition: %+v", id.Partition)
 	}
 }
 
