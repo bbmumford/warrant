@@ -18,7 +18,7 @@ import (
 	"errors"
 )
 
-// ErrMint is returned by Mint when the assertion is invalid at mint time (inconsistent owner
+// ErrMint is returned by Mint when the assertion is invalid at mint time (inconsistent partition
 // representation, or an empty subject) — the trusted edge must not seal an inconsistent bundle.
 var ErrMint = errors.New("mint: invalid assertion")
 
@@ -38,14 +38,14 @@ type Subject struct {
 	Kind SubjectKind
 }
 
-// Assertion is the sealed evidence the trusted edge presents at mint. Owner is the opaque
-// partition; HasOwner distinguishes owner-bound from global. Consistency invariant: HasOwner
-// must equal (Owner != "") — enforced by Consistent().
+// Assertion is the sealed evidence the trusted edge presents at mint. Partition is the opaque
+// partition id; HasPartition distinguishes partition-bound from global. Consistency invariant:
+// HasPartition must equal (Partition != "") — enforced by Consistent().
 type Assertion struct {
 	Subject        Subject
 	PlatformTenant string
-	HasOwner       bool
-	Owner          string
+	HasPartition   bool
+	Partition      string
 	Capabilities   []string
 	Issuer         string
 	Audience       string
@@ -55,9 +55,9 @@ type Assertion struct {
 	Nonce          string
 }
 
-// Consistent reports whether HasOwner agrees with Owner presence. The authority seam denies an
-// inconsistent assertion (owner material on a would-be global, or a claimed owner with no value).
-func (a Assertion) Consistent() bool { return a.HasOwner == (a.Owner != "") }
+// Consistent reports whether HasPartition agrees with Partition presence. The authority seam denies an
+// inconsistent assertion (partition material on a would-be global, or a claimed partition with no value).
+func (a Assertion) Consistent() bool { return a.HasPartition == (a.Partition != "") }
 
 // VerifiedPrincipal is opaque proof. It carries the assertion fields plus the MAC tag — NOT the
 // key. All fields unexported; there is no exported setter, and no accessor exposes the key
@@ -96,7 +96,7 @@ func NewVerifier() (*Verifier, error) {
 }
 
 // Mint stamps a principal with tag = HMAC(key, canonical(assertion)). It validates the assertion
-// at mint time (owner-representation consistency + non-empty subject) and returns ErrMint on an
+// at mint time (partition-representation consistency + non-empty subject) and returns ErrMint on an
 // invalid bundle, so the trusted edge cannot seal an inconsistent one. Claims/caps are defensively
 // copied. The key is not stored in the principal.
 func (v *Verifier) Mint(a Assertion) (VerifiedPrincipal, error) {
@@ -108,8 +108,8 @@ func (v *Verifier) Mint(a Assertion) (VerifiedPrincipal, error) {
 	p := VerifiedPrincipal{
 		subject:   a.Subject,
 		tenant:    a.PlatformTenant,
-		hasOwner:  a.HasOwner,
-		owner:     a.Owner,
+		hasOwner:  a.HasPartition,
+		owner:     a.Partition,
 		caps:      caps,
 		issuer:    a.Issuer,
 		audience:  a.Audience,
@@ -148,7 +148,7 @@ func (p VerifiedPrincipal) assertion() Assertion {
 	caps := make([]string, len(p.caps))
 	copy(caps, p.caps)
 	return Assertion{
-		Subject: p.subject, PlatformTenant: p.tenant, HasOwner: p.hasOwner, Owner: p.owner,
+		Subject: p.subject, PlatformTenant: p.tenant, HasPartition: p.hasOwner, Partition: p.owner,
 		Capabilities: caps, Issuer: p.issuer, Audience: p.audience, Version: p.version,
 		Realm: p.realm, ExpiresAtMS: p.expiresMS, Nonce: p.nonce,
 	}
@@ -159,17 +159,17 @@ func (p VerifiedPrincipal) assertion() Assertion {
 // delimiter ambiguity). Any field change invalidates the tag.
 func canonical(a Assertion) []byte {
 	var b bytes.Buffer
-	writeStr(&b, canonicalContext) // domain separation
+	writeStr(&b, canonicalContext)  // domain separation
 	writeUint(&b, canonicalVersion) // schema version
 	writeStr(&b, string(a.Subject.Kind))
 	writeStr(&b, a.Subject.ID)
 	writeStr(&b, a.PlatformTenant)
-	if a.HasOwner {
+	if a.HasPartition {
 		b.WriteByte(1)
 	} else {
 		b.WriteByte(0)
 	}
-	writeStr(&b, a.Owner)
+	writeStr(&b, a.Partition)
 	writeUint(&b, uint64(len(a.Capabilities)))
 	for _, c := range a.Capabilities {
 		writeStr(&b, c)
@@ -198,8 +198,8 @@ func writeUint(b *bytes.Buffer, n uint64) {
 // a handler holds discloses no minting material.
 func (p VerifiedPrincipal) Subject() Subject       { return p.subject }
 func (p VerifiedPrincipal) PlatformTenant() string { return p.tenant }
-func (p VerifiedPrincipal) HasOwner() bool         { return p.hasOwner }
-func (p VerifiedPrincipal) Owner() string          { return p.owner }
+func (p VerifiedPrincipal) HasPartition() bool     { return p.hasOwner }
+func (p VerifiedPrincipal) Partition() string      { return p.owner }
 
 func (p VerifiedPrincipal) Capabilities() []string {
 	out := make([]string, len(p.caps))
@@ -207,9 +207,9 @@ func (p VerifiedPrincipal) Capabilities() []string {
 	return out
 }
 
-func (p VerifiedPrincipal) Issuer() string      { return p.issuer }
-func (p VerifiedPrincipal) Audience() string    { return p.audience }
-func (p VerifiedPrincipal) Version() string     { return p.version }
-func (p VerifiedPrincipal) Realm() string       { return p.realm }
-func (p VerifiedPrincipal) ExpiresAtMS() int64  { return p.expiresMS }
-func (p VerifiedPrincipal) Nonce() string       { return p.nonce }
+func (p VerifiedPrincipal) Issuer() string     { return p.issuer }
+func (p VerifiedPrincipal) Audience() string   { return p.audience }
+func (p VerifiedPrincipal) Version() string    { return p.version }
+func (p VerifiedPrincipal) Realm() string      { return p.realm }
+func (p VerifiedPrincipal) ExpiresAtMS() int64 { return p.expiresMS }
+func (p VerifiedPrincipal) Nonce() string      { return p.nonce }

@@ -22,7 +22,7 @@ func TestVerifierFmtRedactsKey(t *testing.T) {
 func sample() Assertion {
 	return Assertion{
 		Subject: Subject{ID: "u1", Kind: "user"}, PlatformTenant: "orbtr",
-		HasOwner: true, Owner: "acme", Capabilities: []string{"orbtr.io:device.read"},
+		HasPartition: true, Partition: "acme", Capabilities: []string{"orbtr.io:device.read"},
 		Issuer: "io-edge", Audience: "node.orbtr.io", Version: "v1", Realm: "orbtr.io",
 		ExpiresAtMS: 10_000, Nonce: "nonce-abc123",
 	}
@@ -87,16 +87,16 @@ func TestForeignVerifierRejected(t *testing.T) {
 }
 
 func TestConsistent(t *testing.T) {
-	if !(Assertion{HasOwner: true, Owner: "x"}).Consistent() {
-		t.Fatal("HasOwner+Owner should be consistent")
+	if !(Assertion{HasPartition: true, Partition: "x"}).Consistent() {
+		t.Fatal("HasPartition+Partition should be consistent")
 	}
-	if !(Assertion{HasOwner: false, Owner: ""}).Consistent() {
+	if !(Assertion{HasPartition: false, Partition: ""}).Consistent() {
 		t.Fatal("no-owner should be consistent")
 	}
-	if (Assertion{HasOwner: false, Owner: "x"}).Consistent() {
-		t.Fatal("owner material with HasOwner=false must be inconsistent")
+	if (Assertion{HasPartition: false, Partition: "x"}).Consistent() {
+		t.Fatal("owner material with HasPartition=false must be inconsistent")
 	}
-	if (Assertion{HasOwner: true, Owner: ""}).Consistent() {
-		t.Fatal("HasOwner=true with empty owner must be inconsistent")
+	if (Assertion{HasPartition: true, Partition: ""}).Consistent() {
+		t.Fatal("HasPartition=true with empty owner must be inconsistent")
 	}
 }

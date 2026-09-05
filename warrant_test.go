@@ -71,8 +71,8 @@ func baseAssertion() Assertion {
 	return Assertion{
 		Subject:        Subject{ID: "u1", Kind: "user"},
 		PlatformTenant: tenant,
-		HasOwner:       true,
-		Owner:          "acme",
+		HasPartition:   true,
+		Partition:      "acme",
 		Capabilities:   []string{"orbtr.io:device.read"},
 		Issuer:         issuer,
 		Audience:       aud,
@@ -197,21 +197,21 @@ func TestOwnerBound_OwnerMismatch_Denied(t *testing.T) {
 	}
 }
 
-// TestRepresentationConsistency_MintRejects: HasOwner must equal Owner-presence, enforced AT MINT
+// TestRepresentationConsistency_MintRejects: HasPartition must equal Partition-presence, enforced AT MINT
 // (assurance HOLD 4 / R-2422 (4)) — an inconsistent bundle can never be sealed.
 func TestRepresentationConsistency_MintRejects(t *testing.T) {
 	v, _ := NewVerifier()
 	as := baseAssertion()
-	as.HasOwner = false
-	as.Owner = "acme"
+	as.HasPartition = false
+	as.Partition = "acme"
 	if _, err := v.Mint(as); err == nil {
-		t.Fatal("Mint must reject HasOwner=false with owner material")
+		t.Fatal("Mint must reject HasPartition=false with owner material")
 	}
 	as2 := baseAssertion()
-	as2.HasOwner = true
-	as2.Owner = ""
+	as2.HasPartition = true
+	as2.Partition = ""
 	if _, err := v.Mint(as2); err == nil {
-		t.Fatal("Mint must reject HasOwner=true with an empty owner")
+		t.Fatal("Mint must reject HasPartition=true with an empty owner")
 	}
 	as3 := baseAssertion()
 	as3.Subject = Subject{}
@@ -225,8 +225,8 @@ func TestGlobal_PositiveAndOwnerMaterialRejected(t *testing.T) {
 	a := newAuthz(t, v, fixedClock(5000))
 	// positive global: no owner, holds the global cap.
 	as := baseAssertion()
-	as.HasOwner = false
-	as.Owner = ""
+	as.HasPartition = false
+	as.Partition = ""
 	as.Capabilities = []string{"orbtr.io:tuf.get"}
 	as.Nonce = "n-global-ok"
 	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "tuf.get", ""); err != nil {

@@ -477,8 +477,8 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	if principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.PlatformTenant() != a.expectedTenant {
 		return Identity{}, ErrDenied
 	}
-	// (2a) representation consistency — HasOwner must agree with Owner presence (assurance HOLD 4).
-	if principal.HasOwner() != (principal.Owner() != "") {
+	// (2a) representation consistency — HasPartition must agree with Partition presence (assurance HOLD 4).
+	if principal.HasPartition() != (principal.Partition() != "") {
 		return Identity{}, ErrDenied
 	}
 	// (2b) MANDATORY bounded replay nonce — replay is never caller-optional (assurance HOLD 2).
@@ -513,8 +513,8 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	id := Identity{Subject: principal.Subject(), Capabilities: held}
 	switch route.mode {
 	case modePartitionBound:
-		owner := principal.Owner()
-		if !principal.HasOwner() || !validOwner(owner) || owner != bodyOwner {
+		owner := principal.Partition()
+		if !principal.HasPartition() || !validOwner(owner) || owner != bodyOwner {
 			return Identity{}, ErrDenied
 		}
 		os := newPartition(route.required.Realm(), owner)
@@ -524,7 +524,7 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 		id.Partition = os
 	case modeGlobal:
 		// global routes deny ANY owner material (assurance HOLD 4).
-		if principal.HasOwner() || principal.Owner() != "" || bodyOwner != "" {
+		if principal.HasPartition() || principal.Partition() != "" || bodyOwner != "" {
 			return Identity{}, ErrDenied
 		}
 		if !held.Allows(route.required) {

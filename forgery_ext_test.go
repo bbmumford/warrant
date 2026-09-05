@@ -82,8 +82,8 @@ func main() {
 	as := mint.Assertion{
 		Subject:        mint.Subject{ID: "u1", Kind: "user"},
 		PlatformTenant: "orbtr",
-		HasOwner:       true,
-		Owner:          "acme",
+		HasPartition:       true,
+		Partition:          "acme",
 		Capabilities:   []string{"orbtr.io:device.read"},
 		Issuer:         "io-edge",
 		Audience:       "node.orbtr.io",
