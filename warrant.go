@@ -150,6 +150,12 @@ func NewCapabilitySet(held ...Capability) CapabilitySet { return CapabilitySet{h
 // A set holding no negative capability behaves exactly as it did before deny existed: the deny
 // scan matches nothing and the positive scan decides.
 //
+// The deny scan tests coverage in BOTH directions, because a request can be broader than the
+// revocation that spoils it. Asking for a terminal "*" asks for every action on the resource,
+// so a deny of any single one of them means the set does not confer it: required "token.*"
+// against held "-token.mint" is refused even though the deny covers only part of the request.
+// One-directional matching would let a caller widen its own request past a revocation.
+//
 // required must itself be positive. A negative required is refused rather than inverted, so a
 // caller cannot ask "am I denied?" and read the answer as permission.
 func (s CapabilitySet) Allows(required Capability) bool {
@@ -157,7 +163,7 @@ func (s CapabilitySet) Allows(required Capability) bool {
 		return false
 	}
 	for _, h := range s.held {
-		if h.deny && h.covers(required) {
+		if h.deny && (h.covers(required) || required.covers(h)) {
 			return false
 		}
 	}

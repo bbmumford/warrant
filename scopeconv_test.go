@@ -13,10 +13,16 @@ func conv() ScopeConversion {
 	}
 }
 
+// Renders the deny flag, because a revocation and a grant are otherwise printed
+// identically and a failure message reads as the opposite of what it found.
 func capStrings(caps []Capability) []string {
 	out := make([]string, 0, len(caps))
 	for _, c := range caps {
-		out = append(out, c.realm+":"+c.resource+"."+c.action)
+		s := c.realm + ":" + c.resource + "." + c.action
+		if c.deny {
+			s = "-" + s
+		}
+		out = append(out, s)
 	}
 	sort.Strings(out)
 	return out
@@ -96,12 +102,94 @@ func TestIncompleteVocabularyUnderGrants(t *testing.T) {
 	}
 }
 
-// Deny must subtract regardless of the order scopes arrive in.
-func TestDenySubtractsRegardlessOfOrder(t *testing.T) {
+// Deny must win regardless of the order scopes arrive in. Asserted on the VERDICT,
+// not on the emitted set: a deny is now carried as a negative capability rather
+// than removed, so both a grant and its revocation are present and only Allows
+// says which prevails.
+func TestDenyWinsRegardlessOfOrder(t *testing.T) {
 	a := conv().ScopesToCapabilities([]string{"orbtr.ai.exec.run_as", "-orbtr.ai.exec.run_as"})
 	b := conv().ScopesToCapabilities([]string{"-orbtr.ai.exec.run_as", "orbtr.ai.exec.run_as"})
-	if len(a) != 0 || len(b) != 0 {
-		t.Errorf("deny did not subtract in both orders: %v / %v", capStrings(a), capStrings(b))
+	for name, caps := range map[string][]Capability{"grant-first": a, "deny-first": b} {
+		if allows(t, caps, "orbtr.ai:exec.run_as") {
+			t.Errorf("%s: deny lost to the grant in the same set: %v", name, capStrings(caps))
+		}
+	}
+}
+
+// A DENY FINER THAN THE GRANT IT LIMITS. The realm wildcard emits an action
+// wildcard ("token.*"), and the revocation names one action under it
+// ("token.mint"). Removing denied capabilities from the emitted set cannot
+// express this: no emitted string equals "token.mint", so the revocation
+// vanishes and the wildcard keeps conferring mint — a privilege escalation that
+// builds and tests green everywhere except at the operation itself.
+//
+// The realm-wide-minus-revocations test above passes under either mechanism
+// because it denies at the SAME granularity the wildcard emits. This one does
+// not, which is the whole reason it exists.
+func TestDenyNarrowerThanTheWildcardThatWouldConferIt(t *testing.T) {
+	c := ScopeConversion{
+		Realm:          "orbtr.io.storage",
+		KnownResources: []string{"reservation", "placementclass", "blob", "token", "audit", "access"},
+	}
+	caps := c.ScopesToCapabilities([]string{"orbtr.io.storage.*", "-orbtr.io.storage.token.mint"})
+	if allows(t, caps, "orbtr.io.storage:token.mint") {
+		t.Errorf("a realm wildcard conferred an action that was explicitly revoked: %v", capStrings(caps))
+	}
+	if !allows(t, caps, "orbtr.io.storage:token.read") {
+		t.Errorf("revoking one action removed the rest of the resource: %v", capStrings(caps))
+	}
+	if !allows(t, caps, "orbtr.io.storage:blob.write") {
+		t.Errorf("revoking one action removed an unrelated resource: %v", capStrings(caps))
+	}
+}
+
+// A REVOCATION THE GRAMMAR CANNOT EXPRESS MUST WIDEN, NEVER DISAPPEAR. A
+// per-instance path has no capability form: a capability is realm:resource.action
+// and this names a fourth segment. Conferring nothing for an unrecognised GRANT is
+// safe; conferring nothing for an unrecognised DENY leaves the broad grant intact.
+// So it is widened to the resource.action it sits under — over-broad, and over-broad
+// fails loudly at a legitimate call rather than silently at an illegitimate one.
+func TestInexpressibleDenyWidensRatherThanVanishing(t *testing.T) {
+	c := ScopeConversion{Realm: "orbtr.ai", KnownResources: []string{"exec", "assistant"}}
+	caps := c.ScopesToCapabilities([]string{"orbtr.ai.*", "-orbtr.ai.exec.run_as.system"})
+	if allows(t, caps, "orbtr.ai:exec.run_as") {
+		t.Errorf("a per-instance revocation vanished and left the wildcard conferring it: %v", capStrings(caps))
+	}
+	if !allows(t, caps, "orbtr.ai:exec.mode") {
+		t.Errorf("widening reached past the action it names: %v", capStrings(caps))
+	}
+	if !allows(t, caps, "orbtr.ai:assistant.write") {
+		t.Errorf("widening reached past the resource it names: %v", capStrings(caps))
+	}
+}
+
+// A bare resource names no action, so revoking it revokes the whole resource.
+// The grant path confers nothing for the same shape — the asymmetry is deliberate.
+func TestBareResourceDenyRevokesTheWholeResource(t *testing.T) {
+	caps := conv().ScopesToCapabilities([]string{"orbtr.ai.*", "-orbtr.ai.exec"})
+	if allows(t, caps, "orbtr.ai:exec.run_as") || allows(t, caps, "orbtr.ai:exec.mode") {
+		t.Errorf("a bare-resource revocation left actions on that resource: %v", capStrings(caps))
+	}
+	if !allows(t, caps, "orbtr.ai:assistant.write") {
+		t.Errorf("a bare-resource revocation reached another resource: %v", capStrings(caps))
+	}
+}
+
+// Reserved constrains grants only. Withholding a revocation because it names a
+// reserved resource could only widen access, so the deny is still emitted.
+func TestDenyReachesReservedResources(t *testing.T) {
+	caps := conv().ScopesToCapabilities([]string{"-orbtr.ai.forge.mint"})
+	if len(caps) != 1 || !caps[0].IsDeny() {
+		t.Fatalf("a revocation naming a reserved resource was dropped: %v", capStrings(caps))
+	}
+}
+
+// Another realm's revocation revokes nothing here — nothing here is in its realm.
+// This is the one drop on the deny path, and it is not a widening decision.
+func TestForeignRealmDenyIsIgnored(t *testing.T) {
+	caps := conv().ScopesToCapabilities([]string{"orbtr.ai.exec.run_as", "-orbtr.io.exec.run_as"})
+	if !allows(t, caps, "orbtr.ai:exec.run_as") {
+		t.Errorf("a revocation from another realm suppressed a grant in this one: %v", capStrings(caps))
 	}
 }
 
