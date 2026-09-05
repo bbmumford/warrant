@@ -125,6 +125,30 @@ func (c Capability) IsZero() bool  { return c.realm == "" }
 // IsDeny reports whether c is a negative capability (a revocation).
 func (c Capability) IsDeny() bool { return c.deny }
 
+// String renders the canonical form ParseCapability accepts — "<realm>:<resource>.<action>",
+// prefixed "-" for a negative capability — so ParseCapability(c.String()) reproduces c for every
+// capability ParseCapability can mint. That round trip is what lets a set cross a []string
+// boundary, such as a mint input, without losing what it holds.
+//
+// THE REVOCATION IS CARRIED IN THE STRING, which is the point and the hazard together. A caller
+// that compares these strings, or tests one for membership in a held list, reads "-realm:res.act"
+// as a capability it holds rather than one it is refused. Parse them back and ask
+// CapabilitySet.Allows; never match on the text.
+//
+// A zero Capability renders "" rather than ":.", because it names nothing and ":." would be a
+// string ParseCapability rejects — an empty element is at least visibly empty at the boundary it
+// crosses.
+func (c Capability) String() string {
+	if c.IsZero() {
+		return ""
+	}
+	s := c.realm + ":" + c.resource + "." + c.action
+	if c.deny {
+		s = "-" + s
+	}
+	return s
+}
+
 // covers reports whether c's realm/resource/action pattern matches required, treating a terminal
 // "*" action as covering any action in the same realm+resource. It ignores the deny flag on both
 // sides: callers decide what a match MEANS.
