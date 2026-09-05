@@ -154,6 +154,14 @@ func (c ScopeConversion) expandDeny(scope string) []string {
 	// Anything deeper than resource.action is a per-instance revocation with no
 	// capability form. Widen to the resource.action prefix that does have one:
 	// denying every instance is broader than intended and narrower than nothing.
+	//
+	// TODO: a role whose grant is "everything on this resource MINUS one
+	// instance" cannot be expressed once its resource is in KnownResources —
+	// widening revokes the action outright and takes the rest of the instances
+	// with it. Reaching that point means Capability needs a fourth segment, not
+	// that this widening should be relaxed. Until a resource in some consumer's
+	// vocabulary carries such a revocation, the widened deny is inert: nothing
+	// emits a capability for a resource nobody routes.
 	resource, action := parts[0], parts[1]
 	if action == "" {
 		action = "*"
