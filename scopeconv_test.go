@@ -104,3 +104,53 @@ func TestDenySubtractsRegardlessOfOrder(t *testing.T) {
 		t.Errorf("deny did not subtract in both orders: %v / %v", capStrings(a), capStrings(b))
 	}
 }
+
+// REALM DEPTH IS PART OF THE CONFIGURATION, and getting it wrong converts every
+// scope to nothing — which denies silently rather than erroring.
+//
+// The remainder after trimming Realm must be exactly <resource>.<action>. A
+// consumer whose scopes are "orbtr.io.storage.reservation.read" has a THREE-part
+// remainder under Realm="orbtr.io", so nothing converts; its realm is
+// "orbtr.io.storage" and its resources are reservation/blob/token.
+//
+// This case exists because the converter was generalised from a consumer whose
+// scopes are natively realm.resource.verb, and every other test here inherits
+// that shape. Tested against the shape it was generalised FOR, not only FROM.
+func TestRealmDepthMustMatchTheScopeShape(t *testing.T) {
+	scope := "orbtr.io.storage.reservation.read"
+
+	tooShallow := ScopeConversion{
+		Realm:          "orbtr.io",
+		KnownResources: []string{"storage"},
+	}
+	if got := tooShallow.ScopesToCapabilities([]string{scope}); len(got) != 0 {
+		t.Errorf("a too-shallow realm converted %q to %v; expected nothing "+
+			"(the remainder has 3 parts, not resource.action)", scope, capStrings(got))
+	}
+
+	correct := ScopeConversion{
+		Realm:          "orbtr.io.storage",
+		KnownResources: []string{"reservation", "blob", "token"},
+	}
+	caps := correct.ScopesToCapabilities([]string{scope})
+	if len(caps) != 1 {
+		t.Fatalf("correct realm depth converted %q to %v, want exactly one capability",
+			scope, capStrings(caps))
+	}
+	if !NewCapabilitySet(caps...).Allows(mustCap(t, "orbtr.io.storage:reservation.read")) {
+		t.Errorf("converted capability does not allow the operation it names: %v", capStrings(caps))
+	}
+}
+
+// A realm wildcard has to match the same depth, or it expands across the wrong
+// vocabulary — the failure that would silently empty a whole surface.
+func TestRealmWildcardRespectsRealmDepth(t *testing.T) {
+	c := ScopeConversion{
+		Realm:          "orbtr.io.storage",
+		KnownResources: []string{"reservation", "blob"},
+	}
+	caps := c.ScopesToCapabilities([]string{"orbtr.io.storage.*"})
+	if !NewCapabilitySet(caps...).Allows(mustCap(t, "orbtr.io.storage:blob.write")) {
+		t.Errorf("realm wildcard at the correct depth did not confer blob.write: %v", capStrings(caps))
+	}
+}
