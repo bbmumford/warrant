@@ -139,24 +139,26 @@ func (s CapabilitySet) Subsumes(other CapabilitySet) bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Partition — server-established {realm, owner}. No exported constructor: minted only
-// inside Authorize from the SEALED owner, so a handler can only RECEIVE one.
+// Partition — server-established {realm, id}. No exported constructor: minted
+// only inside Authorize from the sealed principal, so a handler can only
+// RECEIVE one and can never name a partition it was not given.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Partition struct {
 	realm string
-	owner string
+	id    string
 }
 
-func newPartition(realm, owner string) Partition { return Partition{realm: realm, owner: owner} }
+func newPartition(realm, id string) Partition { return Partition{realm: realm, id: id} }
 
 func (o Partition) Realm() string     { return o.realm }
-func (o Partition) Partition() string { return o.owner }
+func (o Partition) Partition() string { return o.id }
 
-// IsZero denies unless BOTH realm and owner are non-empty (a partial scope is not a partition).
-func (o Partition) IsZero() bool { return o.realm == "" || o.owner == "" }
+// IsZero denies unless BOTH realm and id are non-empty; a half-populated value
+// is not a partition and must not satisfy a partition-bound route.
+func (o Partition) IsZero() bool { return o.realm == "" || o.id == "" }
 
-func (o Partition) Equal(x Partition) bool { return o.realm == x.realm && o.owner == x.owner }
+func (o Partition) Equal(x Partition) bool { return o.realm == x.realm && o.id == x.id }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Route — closed sum, keyed by SERVER operation identity (R-2411 pin 2). The Authorizer
