@@ -85,11 +85,26 @@ func validSegment(s string, allowWildcard bool) bool {
 
 func validOwner(s string) bool { return validSegment(s, false) }
 
-// Capability is realm-namespaced: "<realm>:<resource>.<action>". Unexported fields; only
-// ParseCapability mints a valid one.
-type Capability struct{ realm, resource, action string }
+// Capability is realm-namespaced: "<realm>:<resource>.<action>". A leading "-" makes it a
+// NEGATIVE capability — a deny that overrides any positive match in the same set (see
+// CapabilitySet.Allows). Unexported fields; only ParseCapability mints a valid one.
+type Capability struct {
+	realm, resource, action string
+	deny                    bool
+}
 
+// ParseCapability parses "<realm>:<resource>.<action>", or "-<realm>:<resource>.<action>" for a
+// negative capability.
+//
+// The leading "-" MUST be stripped before validation rather than left on the realm: validSegment
+// admits "-" as an ordinary character, so "-orbtr.ai:exec.run_as" would otherwise parse as a
+// capability in a realm literally named "-orbtr.ai" — which matches nothing and therefore denies
+// nothing, silently turning a revocation into a no-op.
 func ParseCapability(s string) (Capability, error) {
+	deny := strings.HasPrefix(s, "-")
+	if deny {
+		s = s[1:]
+	}
 	realm, rest, ok := strings.Cut(s, ":")
 	if !ok {
 		return Capability{}, ErrDenied
@@ -101,11 +116,23 @@ func ParseCapability(s string) (Capability, error) {
 	if !validRealm(realm) || !validSegment(resource, false) || !validSegment(action, true) {
 		return Capability{}, ErrDenied
 	}
-	return Capability{realm: realm, resource: resource, action: action}, nil
+	return Capability{realm: realm, resource: resource, action: action, deny: deny}, nil
 }
 
 func (c Capability) Realm() string { return c.realm }
 func (c Capability) IsZero() bool  { return c.realm == "" }
+
+// IsDeny reports whether c is a negative capability (a revocation).
+func (c Capability) IsDeny() bool { return c.deny }
+
+// covers reports whether c's realm/resource/action pattern matches required, treating a terminal
+// "*" action as covering any action in the same realm+resource. It ignores the deny flag on both
+// sides: callers decide what a match MEANS.
+func (c Capability) covers(required Capability) bool {
+	return c.realm == required.realm &&
+		c.resource == required.resource &&
+		(c.action == required.action || c.action == "*")
+}
 
 // CapabilitySet — same-realm subsumption only; a terminal "*" action subsumes any action in
 // the same realm+resource; cross-realm never subsumes; empty denies. This is where cross-
@@ -114,23 +141,43 @@ type CapabilitySet struct{ held []Capability }
 
 func NewCapabilitySet(held ...Capability) CapabilitySet { return CapabilitySet{held: held} }
 
+// Allows reports whether the set confers required, applying DENY PRECEDENCE: a negative
+// capability covering required refuses it however the set grants it, including through a
+// terminal "*". That ordering is the point — a role written as a broad grant minus specific
+// revocations (e.g. {"orbtr.ai:*", "-orbtr.ai:exec.run_as", "-orbtr.ai:exec.mode"}) can only
+// express the revocation if the deny outranks the wildcard that confers it.
+//
+// A set holding no negative capability behaves exactly as it did before deny existed: the deny
+// scan matches nothing and the positive scan decides.
+//
+// required must itself be positive. A negative required is refused rather than inverted, so a
+// caller cannot ask "am I denied?" and read the answer as permission.
 func (s CapabilitySet) Allows(required Capability) bool {
-	if required.IsZero() {
+	if required.IsZero() || required.deny {
 		return false
 	}
 	for _, h := range s.held {
-		if h.realm != required.realm {
-			continue
+		if h.deny && h.covers(required) {
+			return false
 		}
-		if h.resource == required.resource && (h.action == required.action || h.action == "*") {
+	}
+	for _, h := range s.held {
+		if !h.deny && h.covers(required) {
 			return true
 		}
 	}
 	return false
 }
 
+// Subsumes reports whether s confers everything other confers. A negative capability in other
+// refuses the comparison outright rather than being skipped: "does this set cover that set" has
+// no meaning once that set contains a revocation, and silently ignoring it would let an
+// attenuated set claim to subsume one whose denies it does not reproduce.
 func (s CapabilitySet) Subsumes(other CapabilitySet) bool {
 	for _, o := range other.held {
+		if o.deny {
+			return false
+		}
 		if !s.Allows(o) {
 			return false
 		}
