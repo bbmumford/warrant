@@ -242,3 +242,55 @@ func TestRealmWildcardRespectsRealmDepth(t *testing.T) {
 		t.Errorf("realm wildcard at the correct depth did not confer blob.write: %v", capStrings(caps))
 	}
 }
+
+// A REALM-WIDE REVOCATION MUST NOT DEPEND ON THE CALLER'S VOCABULARY. Grants are
+// enumerated across KnownResources because a positive capability has no resource
+// wildcard, and an incomplete list there only under-grants. Enumerating a
+// revocation the same way inverts that: a resource the consumer forgot to list
+// survives a deny naming the whole realm, which fails OPEN.
+//
+// The asymmetry is the point — the deny path must never consult KnownResources.
+func TestRealmWideDenyReachesResourcesAbsentFromTheVocabulary(t *testing.T) {
+	c := ScopeConversion{Realm: "orbtr", KnownResources: []string{"device", "policy"}}
+	caps := c.ScopesToCapabilities([]string{
+		"orbtr.device.read",
+		"orbtr.inventory.read", // a real resource the vocabulary omits
+		"-orbtr.*",
+	})
+	set := NewCapabilitySet(caps...)
+	if set.Allows(mustCap(t, "orbtr:inventory.read")) {
+		t.Errorf("a realm-wide revocation missed a resource absent from KnownResources: %v", capStrings(caps))
+	}
+	if set.Allows(mustCap(t, "orbtr:device.read")) {
+		t.Errorf("a realm-wide revocation missed a resource present in KnownResources: %v", capStrings(caps))
+	}
+}
+
+// The same hazard one level down: a revocation naming an action across all
+// resources must reach resources the vocabulary omits, and must not spill onto
+// other actions.
+func TestResourceWildcardDenyIsVocabularyIndependentAndActionPrecise(t *testing.T) {
+	c := ScopeConversion{Realm: "orbtr", KnownResources: []string{"device"}}
+	caps := c.ScopesToCapabilities([]string{"orbtr.inventory.read", "orbtr.inventory.write", "-orbtr.*.read"})
+	set := NewCapabilitySet(caps...)
+	if set.Allows(mustCap(t, "orbtr:inventory.read")) {
+		t.Errorf("an all-resource revocation missed an unlisted resource: %v", capStrings(caps))
+	}
+	if !set.Allows(mustCap(t, "orbtr:inventory.write")) {
+		t.Errorf("an all-resource revocation of one action removed another: %v", capStrings(caps))
+	}
+}
+
+// A resource wildcard is admitted ONLY as a revocation. As a grant it would
+// confer an entire realm in a single token, so it must still convert to nothing.
+func TestResourceWildcardIsNotGrantable(t *testing.T) {
+	if _, err := ParseCapability("orbtr:*.read"); err == nil {
+		t.Error("a POSITIVE resource wildcard parsed; it would confer a whole realm in one token")
+	}
+	if _, err := ParseCapability("-orbtr:*.read"); err != nil {
+		t.Errorf("a NEGATIVE resource wildcard must parse: %v", err)
+	}
+	if got := conv().ScopesToCapabilities([]string{"orbtr.ai.*.write"}); len(got) != 0 {
+		t.Errorf("a positive resource-wildcard scope conferred %v, want nothing", capStrings(got))
+	}
+}

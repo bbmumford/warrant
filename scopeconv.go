@@ -25,8 +25,8 @@ type ScopeConversion struct {
 	// A resource absent here is simply not granted: incomplete vocabulary
 	// under-grants, it never over-grants.
 	//
-	// It also bounds how far a widened deny reaches, so a deny naming no
-	// single resource is emitted once per entry here.
+	// It bounds GRANTS ONLY. Revocations never consult it, so a resource missing
+	// from this list cannot escape a revocation that covers it.
 	KnownResources []string
 
 	// Reserved names resources a scope may NEVER mint into, however broad the
@@ -106,7 +106,7 @@ func (c ScopeConversion) expand(scope string) []string {
 	// single capability meaning "everything in this realm" — it has to expand
 	// across the known vocabulary here, which is why KnownResources exists.
 	if scope == "*" || scope == c.Realm+".*" {
-		return c.everyResource("*", true)
+		return c.everyResource("*")
 	}
 
 	resource, action, ok := c.split(scope)
@@ -130,8 +130,13 @@ func (c ScopeConversion) expand(scope string) []string {
 // capability grammar cannot express exactly. Every path either returns
 // capabilities or belongs to another realm.
 func (c ScopeConversion) expandDeny(scope string) []string {
+	// A realm-wide revocation is emitted as ONE resource-wildcard capability rather than
+	// expanded across KnownResources. Expanding it would make the revocation only as
+	// complete as the caller's vocabulary: a resource the consumer forgot to list would
+	// survive a deny that names the entire realm, which fails OPEN — the one direction
+	// nothing here is allowed to fail in.
 	if scope == "*" || scope == c.Realm+".*" {
-		return c.everyResource("*", false)
+		return []string{c.Realm + ":*.*"}
 	}
 
 	rest, ok := strings.CutPrefix(scope, c.Realm+".")
@@ -146,7 +151,7 @@ func (c ScopeConversion) expandDeny(scope string) []string {
 			return nil
 		}
 		if parts[0] == "*" {
-			return c.everyResource("*", false)
+			return []string{c.Realm + ":*.*"}
 		}
 		return []string{c.Realm + ":" + parts[0] + ".*"}
 	}
@@ -167,22 +172,23 @@ func (c ScopeConversion) expandDeny(scope string) []string {
 		action = "*"
 	}
 	if resource == "" || resource == "*" {
-		// No single resource is named, so the deny lands on all of them.
-		return c.everyResource(action, false)
+		// No single resource is named, so the revocation lands on every resource in the
+		// realm — expressed as a wildcard, not enumerated, for the reason above.
+		return []string{c.Realm + ":*." + action}
 	}
 	return []string{c.Realm + ":" + resource + "." + action}
 }
 
-// everyResource emits one capability per known resource at the given action.
-// skipReserved applies on the grant path only; a deny must reach reserved
-// resources too.
-func (c ScopeConversion) everyResource(action string, skipReserved bool) []string {
+// everyResource emits one grant per known resource at the given action, skipping
+// reserved ones. Only the GRANT path enumerates: a realm-wide grant has to name
+// each resource because a positive capability has no resource wildcard, and an
+// incomplete vocabulary there merely under-grants. Revocations use the wildcard
+// instead, so a forgotten resource cannot escape them.
+func (c ScopeConversion) everyResource(action string) []string {
 	out := make([]string, 0, len(c.KnownResources))
 	for _, r := range c.KnownResources {
-		if skipReserved {
-			if _, reserved := c.Reserved[r]; reserved {
-				continue
-			}
+		if _, reserved := c.Reserved[r]; reserved {
+			continue
 		}
 		out = append(out, c.Realm+":"+r+"."+action)
 	}

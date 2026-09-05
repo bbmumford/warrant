@@ -11,6 +11,8 @@ func TestCapabilityStringRoundTripsThroughParse(t *testing.T) {
 		"orbtr.io:device.*",
 		"-orbtr.io:device.read",
 		"-orbtr.io:device.*",
+		"-orbtr.io:*.*",                   // realm-wide revocation
+		"-orbtr.io:*.read",                // one action across every resource
 		"orbtr.ai.storage:token.mint",     // dotted realm
 		"-orbtr.ai.storage:token.mint",    // dotted realm, revoked
 		"orbtr.io:device_group.read-only", // _ and - are legal segment characters

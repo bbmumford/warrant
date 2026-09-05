@@ -88,6 +88,10 @@ func validOwner(s string) bool { return validSegment(s, false) }
 // Capability is realm-namespaced: "<realm>:<resource>.<action>". A leading "-" makes it a
 // NEGATIVE capability — a deny that overrides any positive match in the same set (see
 // CapabilitySet.Allows). Unexported fields; only ParseCapability mints a valid one.
+//
+// A terminal "*" action covers every action on the resource. The RESOURCE may also be "*",
+// but only on a revocation: "-<realm>:*.*" refuses a whole realm, which a positive
+// capability deliberately cannot express.
 type Capability struct {
 	realm, resource, action string
 	deny                    bool
@@ -113,7 +117,11 @@ func ParseCapability(s string) (Capability, error) {
 	if !ok {
 		return Capability{}, ErrDenied
 	}
-	if !validRealm(realm) || !validSegment(resource, false) || !validSegment(action, true) {
+	// A resource wildcard is admitted ONLY on a revocation. Widening a deny can never
+	// grant anything, whereas a positive "<realm>:*.<action>" would confer a whole realm
+	// in one token and is refused. This is what lets a realm-wide revocation be exact
+	// instead of only as complete as the caller's resource vocabulary.
+	if !validRealm(realm) || !validSegment(resource, deny) || !validSegment(action, true) {
 		return Capability{}, ErrDenied
 	}
 	return Capability{realm: realm, resource: resource, action: action, deny: deny}, nil
@@ -154,7 +162,7 @@ func (c Capability) String() string {
 // sides: callers decide what a match MEANS.
 func (c Capability) covers(required Capability) bool {
 	return c.realm == required.realm &&
-		c.resource == required.resource &&
+		(c.resource == required.resource || c.resource == "*") &&
 		(c.action == required.action || c.action == "*")
 }
 
