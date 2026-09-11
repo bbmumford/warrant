@@ -18,11 +18,11 @@ import (
 )
 
 const (
-	tenant    = "orbtr"
-	homeRealm = "orbtr.io"
-	aud       = "node.orbtr.io"
-	issuer    = "io-edge"
-	ver       = "v1"
+	deployment = "orbtr"
+	homeRealm  = "orbtr.io"
+	aud        = "node.orbtr.io"
+	issuer     = "io-edge"
+	ver        = "v1"
 )
 
 func mustCap(t *testing.T, s string) Capability {
@@ -59,27 +59,27 @@ func routes(t *testing.T) []Route {
 
 func newAuthz(t *testing.T, v *Verifier, clock Clock, foreign ...RealmTrust) *Authorizer {
 	t.Helper()
-	a, err := NewAuthorizer(v, tenant, clock, routes(t), homeTrust(), foreign...)
+	a, err := NewAuthorizer(v, deployment, clock, routes(t), homeTrust(), foreign...)
 	if err != nil {
 		t.Fatalf("NewAuthorizer: %v", err)
 	}
 	return a
 }
 
-// baseAssertion is a valid owner-bound home-realm assertion with a valid (mandatory) nonce.
+// baseAssertion is a valid partition-bound home-realm assertion with a valid (mandatory) nonce.
 func baseAssertion() Assertion {
 	return Assertion{
-		Subject:        Subject{ID: "u1", Kind: "user"},
-		PlatformTenant: tenant,
-		HasPartition:   true,
-		Partition:      "acme",
-		Capabilities:   []string{"orbtr.io:device.read"},
-		Issuer:         issuer,
-		Audience:       aud,
-		Version:        ver,
-		Realm:          homeRealm,
-		ExpiresAtMS:    10_000,
-		Nonce:          "nonce-base-01",
+		Subject:      Subject{ID: "u1", Kind: "user"},
+		Deployment:   deployment,
+		HasPartition: true,
+		Partition:    "acme",
+		Capabilities: []string{"orbtr.io:device.read"},
+		Issuer:       issuer,
+		Audience:     aud,
+		Version:      ver,
+		Realm:        homeRealm,
+		ExpiresAtMS:  10_000,
+		Nonce:        "nonce-base-01",
 	}
 }
 
@@ -114,25 +114,25 @@ func TestZeroValuePrincipalDenied(t *testing.T) {
 	}
 }
 
-func TestOwnerBound_Positive(t *testing.T) {
+func TestPartitionBound_Positive(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
 	id, err := a.Authorize(context.Background(), mustMint(t, v, baseAssertion()), "device.read", "acme")
 	if err != nil {
-		t.Fatalf("valid owner-bound request should succeed; got %v", err)
+		t.Fatalf("valid partition-bound request should succeed; got %v", err)
 	}
 	if id.Partition.Realm() != homeRealm || id.Partition.Partition() != "acme" {
 		t.Fatalf("wrong Partition: %+v", id.Partition)
 	}
 }
 
-func TestWrongPlatformTenant_Denied(t *testing.T) {
+func TestWrongDeployment_Denied(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
 	as := baseAssertion()
-	as.PlatformTenant = "someone-else"
+	as.Deployment = "someone-else"
 	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "device.read", "acme"); !denied(err) {
-		t.Fatal("foreign platform tenant must be DENIED")
+		t.Fatal("foreign deployment must be DENIED")
 	}
 }
 
@@ -189,11 +189,11 @@ func TestRealmBinding_ForeignRealmHomeCapDenied(t *testing.T) {
 	}
 }
 
-func TestOwnerBound_OwnerMismatch_Denied(t *testing.T) {
+func TestPartitionBound_PartitionMismatch_Denied(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
 	if _, err := a.Authorize(context.Background(), mustMint(t, v, baseAssertion()), "device.read", "evil"); !denied(err) {
-		t.Fatal("sealed owner != body owner must be DENIED")
+		t.Fatal("sealed partition != body partition must be DENIED")
 	}
 }
 
@@ -205,13 +205,13 @@ func TestRepresentationConsistency_MintRejects(t *testing.T) {
 	as.HasPartition = false
 	as.Partition = "acme"
 	if _, err := v.Mint(as); err == nil {
-		t.Fatal("Mint must reject HasPartition=false with owner material")
+		t.Fatal("Mint must reject HasPartition=false with partition material")
 	}
 	as2 := baseAssertion()
 	as2.HasPartition = true
 	as2.Partition = ""
 	if _, err := v.Mint(as2); err == nil {
-		t.Fatal("Mint must reject HasPartition=true with an empty owner")
+		t.Fatal("Mint must reject HasPartition=true with an empty partition")
 	}
 	as3 := baseAssertion()
 	as3.Subject = Subject{}
@@ -220,10 +220,10 @@ func TestRepresentationConsistency_MintRejects(t *testing.T) {
 	}
 }
 
-func TestGlobal_PositiveAndOwnerMaterialRejected(t *testing.T) {
+func TestGlobal_PositiveAndPartitionMaterialRejected(t *testing.T) {
 	v, _ := NewVerifier()
 	a := newAuthz(t, v, fixedClock(5000))
-	// positive global: no owner, holds the global cap.
+	// positive global: no partition, holds the global cap.
 	as := baseAssertion()
 	as.HasPartition = false
 	as.Partition = ""
@@ -232,12 +232,12 @@ func TestGlobal_PositiveAndOwnerMaterialRejected(t *testing.T) {
 	if _, err := a.Authorize(context.Background(), mustMint(t, v, as), "tuf.get", ""); err != nil {
 		t.Fatalf("valid global request should succeed; got %v", err)
 	}
-	// owner-bearing principal at a global route → denied (owner material).
+	// partition-bearing principal at a global route → denied (partition material).
 	as2 := baseAssertion()
 	as2.Capabilities = []string{"orbtr.io:tuf.get"}
 	as2.Nonce = "n-global-owner"
 	if _, err := a.Authorize(context.Background(), mustMint(t, v, as2), "tuf.get", ""); !denied(err) {
-		t.Fatal("owner-bearing principal at a global route must be DENIED")
+		t.Fatal("partition-bearing principal at a global route must be DENIED")
 	}
 	// global route with a non-empty body owner → denied.
 	if _, err := a.Authorize(context.Background(), mustMint(t, v, withNonce(as, "n-global-body")), "tuf.get", "acme"); !denied(err) {
@@ -338,13 +338,13 @@ func TestNilSeam_FailClosed(t *testing.T) {
 		t.Fatal("nil Authorizer must fail closed")
 	}
 	v, _ := NewVerifier()
-	if _, err := NewAuthorizer(nil, tenant, nil, routes(t), homeTrust()); !denied(err) {
+	if _, err := NewAuthorizer(nil, deployment, nil, routes(t), homeTrust()); !denied(err) {
 		t.Fatal("nil verifier must reject")
 	}
 	if _, err := NewAuthorizer(v, "", nil, routes(t), homeTrust()); !denied(err) {
-		t.Fatal("empty tenant must reject")
+		t.Fatal("empty deployment must reject")
 	}
-	if _, err := NewAuthorizer(v, tenant, nil, routes(t), RealmTrust{}); !denied(err) {
+	if _, err := NewAuthorizer(v, deployment, nil, routes(t), RealmTrust{}); !denied(err) {
 		t.Fatal("invalid home trust must reject")
 	}
 }

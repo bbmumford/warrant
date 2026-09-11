@@ -21,7 +21,7 @@ func TestVerifierFmtRedactsKey(t *testing.T) {
 
 func sample() Assertion {
 	return Assertion{
-		Subject: Subject{ID: "u1", Kind: "user"}, PlatformTenant: "orbtr",
+		Subject: Subject{ID: "u1", Kind: "user"}, Deployment: "orbtr",
 		HasPartition: true, Partition: "acme", Capabilities: []string{"orbtr.io:device.read"},
 		Issuer: "io-edge", Audience: "node.orbtr.io", Version: "v1", Realm: "orbtr.io",
 		ExpiresAtMS: 10_000, Nonce: "nonce-abc123",
@@ -58,11 +58,11 @@ func TestMACTamperEvident(t *testing.T) {
 	}
 	// tamper with each field on a copy; the stored tag no longer matches the recomputed one.
 	mutators := []func(*VerifiedPrincipal){
-		func(x *VerifiedPrincipal) { x.owner = "evil" },
+		func(x *VerifiedPrincipal) { x.partition = "evil" },
 		func(x *VerifiedPrincipal) { x.realm = "orbtr.ai" },
 		func(x *VerifiedPrincipal) { x.nonce = "different" },
 		func(x *VerifiedPrincipal) { x.caps = []string{"orbtr.io:device.admin"} },
-		func(x *VerifiedPrincipal) { x.tenant = "someone-else" },
+		func(x *VerifiedPrincipal) { x.deployment = "someone-else" },
 		func(x *VerifiedPrincipal) { x.expiresMS = 1 << 40 },
 	}
 	for i, mut := range mutators {

@@ -81,7 +81,7 @@ func main() {
 	// A perfect assertion — only the secret is the forger's own.
 	as := mint.Assertion{
 		Subject:        mint.Subject{ID: "u1", Kind: "user"},
-		PlatformTenant: "orbtr",
+		Deployment: "orbtr",
 		HasPartition:       true,
 		Partition:          "acme",
 		Capabilities:   []string{"orbtr.io:device.read"},

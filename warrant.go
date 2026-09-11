@@ -28,8 +28,8 @@ import (
 )
 
 // ErrDenied is the SINGLE non-disclosing deny. Every failure — forged/unverified seal, wrong
-// platform tenant, unknown operation, untrusted/expired assertion, realm mismatch, absent or
-// mismatched owner, unmet capability, replayed nonce, nil seam, malformed grammar — surfaces
+// deployment, unknown operation, untrusted/expired assertion, realm mismatch, absent or
+// mismatched partition, unmet capability, replayed nonce, nil seam, malformed grammar — surfaces
 // as this, so a refusal never discloses which leg failed.
 var ErrDenied = errors.New("authorization denied")
 
@@ -83,7 +83,7 @@ func validSegment(s string, allowWildcard bool) bool {
 	return true
 }
 
-func validOwner(s string) bool { return validSegment(s, false) }
+func validPartition(s string) bool { return validSegment(s, false) }
 
 // Capability is realm-namespaced: "<realm>:<resource>.<action>". A leading "-" makes it a
 // NEGATIVE capability — a deny that overrides any positive match in the same set (see
@@ -268,8 +268,8 @@ type Route struct {
 	required Capability
 }
 
-// PartitionBoundRoute: a per-owner op; the resolved Partition's realm equals the capability's
-// realm, and the sealed owner must equal the op's body owner.
+// PartitionBoundRoute: a per-partition op; the resolved Partition's realm equals the capability's
+// realm, and the sealed partition must equal the op's body partition.
 func PartitionBoundRoute(op OperationID, required Capability) (Route, error) {
 	if op == "" || required.IsZero() {
 		return Route{}, ErrDenied
@@ -277,7 +277,7 @@ func PartitionBoundRoute(op OperationID, required Capability) (Route, error) {
 	return Route{op: op, mode: modePartitionBound, required: required}, nil
 }
 
-// GlobalRoute: a genuinely owner-less op; rejects any owner-bearing principal.
+// GlobalRoute: a genuinely partition-less op; rejects any partition-bearing principal.
 func GlobalRoute(op OperationID, required Capability) (Route, error) {
 	if op == "" || required.IsZero() {
 		return Route{}, ErrDenied
@@ -456,17 +456,17 @@ type Identity struct {
 }
 
 // Authorizer is the ONE enforcement seam. It is constructed once by the trusted host with a
-// paired Verifier, the expected platform tenant, pinned trust (home + foreign), an immutable
+// paired Verifier, the deployment it serves, pinned trust (home + foreign), an immutable
 // route table, and a clock. Handlers receive it and call Authorize; they cannot construct or
 // select it, nor supply a route, clock, nonce, trust, or capability.
 type Authorizer struct {
-	verifier       *mint.Verifier
-	expectedTenant string
-	audience       string
-	trust          map[string]RealmTrust
-	routes         map[OperationID]Route
-	mono           *monoClock
-	replay         *replayStore
+	verifier           *mint.Verifier
+	expectedDeployment string
+	audience           string
+	trust              map[string]RealmTrust
+	routes             map[OperationID]Route
+	mono               *monoClock
+	replay             *replayStore
 }
 
 // GoString and String redact the handler-facing Authorizer: it holds the Verifier (and thus the
@@ -475,11 +475,11 @@ func (a *Authorizer) GoString() string { return "warrant.Authorizer{redacted: ho
 func (a *Authorizer) String() string   { return "warrant.Authorizer{redacted}" }
 
 // NewAuthorizer validates the receiver config, every trust entry, and every route at
-// construction (fail-closed): nil verifier, empty tenant, invalid home trust, an invalid or
+// construction (fail-closed): nil verifier, empty deployment, invalid home trust, an invalid or
 // audience-mismatched or home-colliding or duplicate foreign entry, or an invalid/duplicate
 // route all reject. A nil clock defaults to real wall time.
-func NewAuthorizer(verifier *Verifier, expectedTenant string, clock Clock, routes []Route, home RealmTrust, foreign ...RealmTrust) (*Authorizer, error) {
-	if verifier == nil || expectedTenant == "" || !home.valid() {
+func NewAuthorizer(verifier *Verifier, expectedDeployment string, clock Clock, routes []Route, home RealmTrust, foreign ...RealmTrust) (*Authorizer, error) {
+	if verifier == nil || expectedDeployment == "" || !home.valid() {
 		return nil, ErrDenied
 	}
 	trust := map[string]RealmTrust{home.Realm: home}
@@ -506,13 +506,13 @@ func NewAuthorizer(verifier *Verifier, expectedTenant string, clock Clock, route
 		clock = func() int64 { return time.Now().UnixMilli() }
 	}
 	return &Authorizer{
-		verifier:       verifier,
-		expectedTenant: expectedTenant,
-		audience:       home.Audience,
-		trust:          trust,
-		routes:         rm,
-		mono:           &monoClock{clock: clock},
-		replay:         newReplayStore(),
+		verifier:           verifier,
+		expectedDeployment: expectedDeployment,
+		audience:           home.Audience,
+		trust:              trust,
+		routes:             rm,
+		mono:               &monoClock{clock: clock},
+		replay:             newReplayStore(),
 	}, nil
 }
 
@@ -543,12 +543,12 @@ func (a *Authorizer) trustAccepts(p VerifiedPrincipal, now int64) bool {
 }
 
 // Authorize enforces every invariant, in order: (1) seal verified against the receiver's own
-// secret, constant-time; (2) subject validity + platform-tenant admission; (3) immutable
+// secret, constant-time; (2) subject validity + deployment admission; (3) immutable
 // server-operation route lookup; (4) sealed assertion trust + expiry against the owned clock;
-// (5) sealed capabilities parsed + owner/realm/capability binding; (6) atomic replay consume
+// (5) sealed capabilities parsed + partition/realm/capability binding; (6) atomic replay consume
 // LAST, only after every prior check passes, so a failed attempt cannot poison a nonce.
-// Non-disclosing: every failure is ErrDenied. bodyOwner is the op-specific owner (compare-only).
-func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal, op OperationID, bodyOwner string) (Identity, error) {
+// Non-disclosing: every failure is ErrDenied. bodyPartition is the op-specific partition (compare-only).
+func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal, op OperationID, bodyPartition string) (Identity, error) {
 	_ = ctx
 	// nil-seam fail-closed.
 	if a == nil || a.verifier == nil || a.replay == nil || a.mono == nil {
@@ -559,7 +559,7 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 		return Identity{}, ErrDenied
 	}
 	// (2) subject validity + admission binding.
-	if principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.PlatformTenant() != a.expectedTenant {
+	if principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.Deployment() != a.expectedDeployment {
 		return Identity{}, ErrDenied
 	}
 	// (2a) representation consistency — HasPartition must agree with Partition presence (assurance HOLD 4).
@@ -582,8 +582,8 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	}
 	// (4) sealed capabilities parsed here (never caller-authored); a malformed grant denies. Every
 	// capability MUST be in the principal's realm (assurance HOLD 1) — no cross-realm capability. This
-	// and the owner/global binding below are DETERMINISTIC (no clock), so they run BEFORE the single
-	// time sample: a malformed/unmet-capability or wrong-owner denial reads the clock ZERO times, and
+	// and the partition/global binding below are DETERMINISTIC (no clock), so they run BEFORE the single
+	// time sample: a malformed/unmet-capability or wrong-partition denial reads the clock ZERO times, and
 	// only a decision that has passed EVERY deterministic authority check reaches the clock — so no
 	// capability-bundle work can age the decision instant between admission and consume.
 	caps := make([]Capability, 0, len(principal.Capabilities()))
@@ -598,18 +598,18 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	id := Identity{Subject: principal.Subject(), Capabilities: held}
 	switch route.mode {
 	case modePartitionBound:
-		owner := principal.Partition()
-		if !principal.HasPartition() || !validOwner(owner) || owner != bodyOwner {
+		partition := principal.Partition()
+		if !principal.HasPartition() || !validPartition(partition) || partition != bodyPartition {
 			return Identity{}, ErrDenied
 		}
-		os := newPartition(route.required.Realm(), owner)
+		os := newPartition(route.required.Realm(), partition)
 		if os.IsZero() || !held.Allows(route.required) {
 			return Identity{}, ErrDenied
 		}
 		id.Partition = os
 	case modeGlobal:
-		// global routes deny ANY owner material (assurance HOLD 4).
-		if principal.HasPartition() || principal.Partition() != "" || bodyOwner != "" {
+		// global routes deny ANY partition material (assurance HOLD 4).
+		if principal.HasPartition() || principal.Partition() != "" || bodyPartition != "" {
 			return Identity{}, ErrDenied
 		}
 		if !held.Allows(route.required) {
@@ -619,8 +619,8 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 		return Identity{}, ErrDenied
 	}
 	// (5) ONE authoritative decision instant, sampled EXACTLY ONCE here — after every DETERMINISTIC
-	// authority check above (seal, subject, tenant, representation, nonce, route, realm, capability,
-	// owner/global) and immediately before the two time-dependent steps, which share it. A single
+	// authority check above (seal, subject, deployment, representation, nonce, route, realm, capability,
+	// partition/global) and immediately before the two time-dependent steps, which share it. A single
 	// monotonic read per decision: a deterministic denial never reads the clock, and nothing between
 	// admission and consume can age the instant. monoClock keeps it rollback-safe; trustAccepts denies
 	// at now >= ExpiresAtMS (exact-expiry).

@@ -42,17 +42,17 @@ type Subject struct {
 // partition id; HasPartition distinguishes partition-bound from global. Consistency invariant:
 // HasPartition must equal (Partition != "") — enforced by Consistent().
 type Assertion struct {
-	Subject        Subject
-	PlatformTenant string
-	HasPartition   bool
-	Partition      string
-	Capabilities   []string
-	Issuer         string
-	Audience       string
-	Version        string
-	Realm          string
-	ExpiresAtMS    int64
-	Nonce          string
+	Subject      Subject
+	Deployment   string
+	HasPartition bool
+	Partition    string
+	Capabilities []string
+	Issuer       string
+	Audience     string
+	Version      string
+	Realm        string
+	ExpiresAtMS  int64
+	Nonce        string
 }
 
 // Consistent reports whether HasPartition agrees with Partition presence. The authority seam denies an
@@ -63,18 +63,18 @@ func (a Assertion) Consistent() bool { return a.HasPartition == (a.Partition != 
 // key. All fields unexported; there is no exported setter, and no accessor exposes the key
 // (there is no key here to expose). Verifying requires the Verifier that holds the key.
 type VerifiedPrincipal struct {
-	subject   Subject
-	tenant    string
-	hasOwner  bool
-	owner     string
-	caps      []string
-	issuer    string
-	audience  string
-	version   string
-	realm     string
-	expiresMS int64
-	nonce     string
-	tag       []byte // HMAC(key, canonical(assertion)); a non-secret MAC output, never the key
+	subject      Subject
+	deployment   string
+	hasPartition bool
+	partition    string
+	caps         []string
+	issuer       string
+	audience     string
+	version      string
+	realm        string
+	expiresMS    int64
+	nonce        string
+	tag          []byte // HMAC(key, canonical(assertion)); a non-secret MAC output, never the key
 }
 
 const keyLen = 32
@@ -106,17 +106,17 @@ func (v *Verifier) Mint(a Assertion) (VerifiedPrincipal, error) {
 	caps := make([]string, len(a.Capabilities))
 	copy(caps, a.Capabilities)
 	p := VerifiedPrincipal{
-		subject:   a.Subject,
-		tenant:    a.PlatformTenant,
-		hasOwner:  a.HasPartition,
-		owner:     a.Partition,
-		caps:      caps,
-		issuer:    a.Issuer,
-		audience:  a.Audience,
-		version:   a.Version,
-		realm:     a.Realm,
-		expiresMS: a.ExpiresAtMS,
-		nonce:     a.Nonce,
+		subject:      a.Subject,
+		deployment:   a.Deployment,
+		hasPartition: a.HasPartition,
+		partition:    a.Partition,
+		caps:         caps,
+		issuer:       a.Issuer,
+		audience:     a.Audience,
+		version:      a.Version,
+		realm:        a.Realm,
+		expiresMS:    a.ExpiresAtMS,
+		nonce:        a.Nonce,
 	}
 	p.tag = v.mac(p.assertion())
 	return p, nil
@@ -148,7 +148,7 @@ func (p VerifiedPrincipal) assertion() Assertion {
 	caps := make([]string, len(p.caps))
 	copy(caps, p.caps)
 	return Assertion{
-		Subject: p.subject, PlatformTenant: p.tenant, HasPartition: p.hasOwner, Partition: p.owner,
+		Subject: p.subject, Deployment: p.deployment, HasPartition: p.hasPartition, Partition: p.partition,
 		Capabilities: caps, Issuer: p.issuer, Audience: p.audience, Version: p.version,
 		Realm: p.realm, ExpiresAtMS: p.expiresMS, Nonce: p.nonce,
 	}
@@ -163,7 +163,7 @@ func canonical(a Assertion) []byte {
 	writeUint(&b, canonicalVersion) // schema version
 	writeStr(&b, string(a.Subject.Kind))
 	writeStr(&b, a.Subject.ID)
-	writeStr(&b, a.PlatformTenant)
+	writeStr(&b, a.Deployment)
 	if a.HasPartition {
 		b.WriteByte(1)
 	} else {
@@ -196,10 +196,10 @@ func writeUint(b *bytes.Buffer, n uint64) {
 
 // Read-only accessors. There is NO tag accessor and NO key anywhere in the principal, so a value
 // a handler holds discloses no minting material.
-func (p VerifiedPrincipal) Subject() Subject       { return p.subject }
-func (p VerifiedPrincipal) PlatformTenant() string { return p.tenant }
-func (p VerifiedPrincipal) HasPartition() bool     { return p.hasOwner }
-func (p VerifiedPrincipal) Partition() string      { return p.owner }
+func (p VerifiedPrincipal) Subject() Subject   { return p.subject }
+func (p VerifiedPrincipal) Deployment() string { return p.deployment }
+func (p VerifiedPrincipal) HasPartition() bool { return p.hasPartition }
+func (p VerifiedPrincipal) Partition() string  { return p.partition }
 
 func (p VerifiedPrincipal) Capabilities() []string {
 	out := make([]string, len(p.caps))
