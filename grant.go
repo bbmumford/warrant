@@ -11,8 +11,17 @@ import (
 
 // GrantPolicy turns the capability strings a role or key is AUTHORED with into
 // the set it actually confers. A consumer holds one per realm it grants in and
-// calls Grant wherever it loads a role, a key's capability list, or any other
-// stored grant; the result feeds NewCapabilitySet.
+// calls Grant where it reads a stored grant out of storage; the result feeds
+// NewCapabilitySet.
+//
+// NEVER APPLY IT TO A PRINCIPAL'S HELD CAPABILITIES. Held capabilities arrive on
+// a VerifiedPrincipal that the edge minted from a completed authentication, and
+// a minted principal MAY carry a reserved family — carrying one is what proves
+// it was minted rather than granted, which is the whole property Reserved
+// exists to create. Passing held capabilities through Grant strips exactly that
+// capability, so the authority it was minted to confer silently stops applying
+// and every test that does not mint a reserved family stays green. Grant reads
+// what an author wrote; Authorize reads what a principal holds.
 //
 // It exists because an authored grant and a minted one are different acts with
 // different trust. Mint is performed by the edge from a completed
