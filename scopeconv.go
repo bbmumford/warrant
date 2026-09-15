@@ -19,6 +19,17 @@ type ScopeConversion struct {
 	// "orbtr.io.storage", not "orbtr.io".
 	Realm string
 
+	// OutRealm is the realm emitted capabilities carry, when it differs from the
+	// realm scopes are read at. Empty means Realm, so a conversion that reads and
+	// emits in one realm sets only Realm and behaves exactly as before.
+	//
+	// The two separate because the input realm says which scopes this conversion
+	// is willing to read, while the output realm is what a capability reader
+	// compares for sameness — so the output realm is what stops one issuer's
+	// capabilities satisfying another's routes when both name the same resource.
+	// Reading a shared vocabulary and emitting into a distinct realm needs both.
+	OutRealm string
+
 	// KnownResources is the resource vocabulary a realm-wide wildcard expands
 	// across. It is the ONLY thing that gives "<realm>.*" meaning, because a
 	// capability has no resource-level wildcard — see ScopesToCapabilities.
@@ -122,7 +133,7 @@ func (c ScopeConversion) expand(scope string) []string {
 		return nil
 	}
 	// action may be "*" — that IS expressible, as an action-wildcard capability.
-	return []string{c.Realm + ":" + resource + "." + action}
+	return []string{c.outRealm() + ":" + resource + "." + action}
 }
 
 // expandDeny turns one revocation into the capability strings it revokes,
@@ -136,7 +147,7 @@ func (c ScopeConversion) expandDeny(scope string) []string {
 	// survive a deny that names the entire realm, which fails OPEN — the one direction
 	// nothing here is allowed to fail in.
 	if scope == "*" || scope == c.Realm+".*" {
-		return []string{c.Realm + ":*.*"}
+		return []string{c.outRealm() + ":*.*"}
 	}
 
 	rest, ok := strings.CutPrefix(scope, c.Realm+".")
@@ -151,9 +162,9 @@ func (c ScopeConversion) expandDeny(scope string) []string {
 			return nil
 		}
 		if parts[0] == "*" {
-			return []string{c.Realm + ":*.*"}
+			return []string{c.outRealm() + ":*.*"}
 		}
-		return []string{c.Realm + ":" + parts[0] + ".*"}
+		return []string{c.outRealm() + ":" + parts[0] + ".*"}
 	}
 
 	// Anything deeper than resource.action is a per-instance revocation with no
@@ -174,9 +185,9 @@ func (c ScopeConversion) expandDeny(scope string) []string {
 	if resource == "" || resource == "*" {
 		// No single resource is named, so the revocation lands on every resource in the
 		// realm — expressed as a wildcard, not enumerated, for the reason above.
-		return []string{c.Realm + ":*." + action}
+		return []string{c.outRealm() + ":*." + action}
 	}
-	return []string{c.Realm + ":" + resource + "." + action}
+	return []string{c.outRealm() + ":" + resource + "." + action}
 }
 
 // everyResource emits one grant per known resource at the given action, skipping
@@ -190,7 +201,7 @@ func (c ScopeConversion) everyResource(action string) []string {
 		if _, reserved := c.Reserved[r]; reserved {
 			continue
 		}
-		out = append(out, c.Realm+":"+r+"."+action)
+		out = append(out, c.outRealm()+":"+r+"."+action)
 	}
 	return out
 }
@@ -207,4 +218,14 @@ func (c ScopeConversion) split(scope string) (resource, action string, ok bool) 
 		return "", "", false
 	}
 	return parts[0], parts[1], true
+}
+
+// outRealm is the realm capabilities are emitted into: OutRealm when set,
+// otherwise Realm. Defaulting here rather than at each construction is what lets
+// a conversion that never sets it keep behaving exactly as it did.
+func (c ScopeConversion) outRealm() string {
+	if c.OutRealm != "" {
+		return c.OutRealm
+	}
+	return c.Realm
 }
