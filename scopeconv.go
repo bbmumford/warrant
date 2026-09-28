@@ -10,13 +10,13 @@ import "strings"
 // capabilities. A consumer supplies its own realm and resource vocabulary; this
 // package supplies neither, so it never learns what any realm contains.
 type ScopeConversion struct {
-	// Realm is the capability realm these scopes belong to, e.g. "orbtr.ai".
+	// Realm is the capability realm these scopes belong to, e.g. "orbtr".
 	// A scope not prefixed with it converts to nothing.
 	//
 	// The remainder after trimming it must be exactly <resource>.<action>, so
 	// the realm has to be set to the FULL namespace root the scopes are built
-	// on: scopes shaped "orbtr.io.storage.token.mint" need Realm
-	// "orbtr.io.storage", not "orbtr.io".
+	// on: scopes shaped "orbtr.control.audit.read" need Realm
+	// "orbtr.control", not "orbtr".
 	Realm string
 
 	// OutRealm is the realm emitted capabilities carry, when it differs from the

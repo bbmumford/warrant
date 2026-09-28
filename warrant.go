@@ -51,7 +51,7 @@ func NewVerifier() (*Verifier, error) { return mint.NewVerifier() }
 const maxTokenLen = 64
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Canonical grammar. realm may contain "." (an RPC-namespace root, e.g. orbtr.ai) but never
+// Canonical grammar. realm may contain "." (e.g. orbtr.control) but never
 // a leading/trailing/double dot; resource/action are single dotless segments; action may be
 // a terminal "*".
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,8 +101,8 @@ type Capability struct {
 // negative capability.
 //
 // The leading "-" MUST be stripped before validation rather than left on the realm: validSegment
-// admits "-" as an ordinary character, so "-orbtr.ai:exec.run_as" would otherwise parse as a
-// capability in a realm literally named "-orbtr.ai" — which matches nothing and therefore denies
+// admits "-" as an ordinary character, so "-orbtr:exec.run_as" would otherwise parse as a
+// capability in a realm literally named "-orbtr" — which matches nothing and therefore denies
 // nothing, silently turning a revocation into a no-op.
 func ParseCapability(s string) (Capability, error) {
 	deny := strings.HasPrefix(s, "-")
@@ -168,7 +168,7 @@ func (c Capability) covers(required Capability) bool {
 
 // CapabilitySet — same-realm subsumption only; a terminal "*" action subsumes any action in
 // the same realm+resource; cross-realm never subsumes; empty denies. This is where cross-
-// realm requests fail: a route requiring orbtr.io:* is never met by an orbtr.ai capability.
+// realm requests fail: an orbtr capability never meets a route requiring an orbtr.control one.
 type CapabilitySet struct{ held []Capability }
 
 func NewCapabilitySet(held ...Capability) CapabilitySet { return CapabilitySet{held: held} }
@@ -176,7 +176,7 @@ func NewCapabilitySet(held ...Capability) CapabilitySet { return CapabilitySet{h
 // Allows reports whether the set confers required, applying DENY PRECEDENCE: a negative
 // capability covering required refuses it however the set grants it, including through a
 // terminal "*". That ordering is the point — a role written as a broad grant minus specific
-// revocations (e.g. {"orbtr.ai:*", "-orbtr.ai:exec.run_as", "-orbtr.ai:exec.mode"}) can only
+// revocations (e.g. {"orbtr:exec.*", "-orbtr:exec.run_as", "-orbtr:exec.mode"}) can only
 // express the revocation if the deny outranks the wildcard that confers it.
 //
 // A set holding no negative capability behaves exactly as it did before deny existed: the deny
