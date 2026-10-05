@@ -292,17 +292,22 @@ func GlobalRoute(op OperationID, required Capability) (Route, error) {
 
 // RealmTrust is an owner-ratified receiver-local trust entry. The home realm has one too;
 // foreign realms add theirs. Audience is the receiver this realm issues tokens for.
+// GrammarVersion is the capability grammar this realm's sets are written in and
+// PolicyDigest the one value standing for the whole policy identity: both are read in
+// realmpolicy.go, bound by NewAuthorizer and compared by trustAccepts.
 type RealmTrust struct {
-	Realm         string
-	Issuer        string
-	Audience      string
-	PolicyVersion string
-	ExpiresAtMS   int64
-	Revoked       bool
+	Realm          string
+	Issuer         string
+	Audience       string
+	PolicyVersion  string
+	GrammarVersion string
+	PolicyDigest   string
+	ExpiresAtMS    int64
+	Revoked        bool
 }
 
 func (rt RealmTrust) valid() bool {
-	return validRealm(rt.Realm) && rt.Issuer != "" && rt.Audience != "" && rt.PolicyVersion != "" && rt.ExpiresAtMS > 0
+	return validRealm(rt.Realm) && rt.Issuer != "" && rt.Audience != "" && rt.PolicyVersion != "" && rt.ExpiresAtMS > 0 && rt.policyIdentityValid()
 }
 
 // Clock returns the current time in unix-milliseconds. The Authorizer owns one; Authorize
@@ -477,20 +482,15 @@ func (a *Authorizer) String() string   { return "warrant.Authorizer{redacted}" }
 // NewAuthorizer validates the receiver config, every trust entry, and every route at
 // construction (fail-closed): nil verifier, empty deployment, invalid home trust, an invalid or
 // audience-mismatched or home-colliding or duplicate foreign entry, or an invalid/duplicate
-// route all reject. A nil clock defaults to real wall time.
+// route all reject. pinnedTrust also BINDS each entry's policy digest here, so the value
+// Authorize compares is fixed at construction. A nil clock defaults to real wall time.
 func NewAuthorizer(verifier *Verifier, expectedDeployment string, clock Clock, routes []Route, home RealmTrust, foreign ...RealmTrust) (*Authorizer, error) {
-	if verifier == nil || expectedDeployment == "" || !home.valid() {
+	if verifier == nil || expectedDeployment == "" {
 		return nil, ErrDenied
 	}
-	trust := map[string]RealmTrust{home.Realm: home}
-	for _, e := range foreign {
-		if !e.valid() || e.Realm == home.Realm || e.Audience != home.Audience {
-			return nil, ErrDenied
-		}
-		if _, dup := trust[e.Realm]; dup {
-			return nil, ErrDenied
-		}
-		trust[e.Realm] = e
+	trust, err := pinnedTrust(home, foreign)
+	if err != nil {
+		return nil, err
 	}
 	rm := make(map[OperationID]Route, len(routes))
 	for _, r := range routes {
@@ -518,8 +518,9 @@ func NewAuthorizer(verifier *Verifier, expectedDeployment string, clock Clock, r
 
 // trustAccepts verifies the principal's sealed assertion against pinned trust and the
 // Authorizer's OWN clock: the principal's realm must have a live (unrevoked, unexpired) trust
-// entry whose issuer/audience/version match the sealed assertion, the token must not be
-// expired, and its audience must be this receiver's.
+// entry whose bound policy digest matches the identity the assertion presents — issuer,
+// audience, policy version and grammar version in one comparison (policyMatches) — the token
+// must not be expired, and its audience must be this receiver's.
 func (a *Authorizer) trustAccepts(p VerifiedPrincipal, now int64) bool {
 	realm := p.Realm()
 	if !validRealm(realm) {
@@ -539,7 +540,7 @@ func (a *Authorizer) trustAccepts(p VerifiedPrincipal, now int64) bool {
 	if p.Audience() != a.audience {
 		return false
 	}
-	return e.Issuer == p.Issuer() && e.Audience == p.Audience() && e.PolicyVersion == p.Version()
+	return e.policyMatches(p)
 }
 
 // Authorize enforces every invariant, in order: (1) seal verified against the receiver's own
@@ -580,21 +581,17 @@ func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal,
 	if principal.Realm() != route.required.Realm() {
 		return Identity{}, ErrDenied
 	}
-	// (4) sealed capabilities parsed here (never caller-authored); a malformed grant denies. Every
-	// capability MUST be in the principal's realm (assurance HOLD 1) — no cross-realm capability. This
-	// and the partition/global binding below are DETERMINISTIC (no clock), so they run BEFORE the single
-	// time sample: a malformed/unmet-capability or wrong-partition denial reads the clock ZERO times, and
-	// only a decision that has passed EVERY deterministic authority check reaches the clock — so no
-	// capability-bundle work can age the decision instant between admission and consume.
-	caps := make([]Capability, 0, len(principal.Capabilities()))
-	for _, s := range principal.Capabilities() {
-		c, err := ParseCapability(s)
-		if err != nil || c.Realm() != principal.Realm() {
-			return Identity{}, ErrDenied
-		}
-		caps = append(caps, c)
+	// (4) sealed capabilities parsed here (never caller-authored) as ONE set: a malformed element, a
+	// cross-realm element (assurance HOLD 1) or a set past MaxCapabilitiesPerSet denies the whole set
+	// rather than part of it (ParseHeldSet). This and the partition/global binding below are
+	// DETERMINISTIC (no clock), so they run BEFORE the single time sample: a malformed/unmet-capability
+	// or wrong-partition denial reads the clock ZERO times, and only a decision that has passed EVERY
+	// deterministic authority check reaches the clock — so no capability-bundle work can age the
+	// decision instant between admission and consume.
+	held, err := ParseHeldSet(principal.Capabilities(), principal.Realm())
+	if err != nil {
+		return Identity{}, ErrDenied
 	}
-	held := NewCapabilitySet(caps...)
 	id := Identity{Subject: principal.Subject(), Capabilities: held}
 	switch route.mode {
 	case modePartitionBound:
