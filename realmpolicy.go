@@ -83,11 +83,17 @@ func (rt RealmTrust) pinned() RealmTrust {
 	return rt
 }
 
-// policyMatches reports whether the policy identity p presents digests to the value
-// bound on this entry, compared in constant time. It is what trustAccepts asks instead
-// of comparing issuer, audience and policy version one by one, and it binds the grammar
-// version into the same comparison, so a receiver implementing one grammar cannot accept
-// a set a realm issued under another.
+// policyMatches reports whether the identity p presents digests to the value bound on
+// this entry, compared in constant time. It is what trustAccepts asks instead of
+// comparing issuer, audience and policy version one by one, so a field a later reader
+// forgets to compare cannot be the one a foreign principal passes on.
+//
+// What it decides is realm, issuer, audience and policy version. The grammar version is
+// among the digested fields but is taken from THIS entry on both sides, so it is equal by
+// construction and decides nothing here: a principal carries no grammar token to compare
+// it against. policyIdentityValid is what holds the grammar — it refuses any entry whose
+// grammar is not the one ParseCapability implements — so every entry reaching here is
+// already at that one grammar, and a comparison here could only repeat it.
 //
 // An entry whose digest was never bound compares as a different length and denies, so a
 // trust entry that reached a decision without passing through pinned authorizes nothing.

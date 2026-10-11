@@ -518,9 +518,9 @@ func NewAuthorizer(verifier *Verifier, expectedDeployment string, clock Clock, r
 
 // trustAccepts verifies the principal's sealed assertion against pinned trust and the
 // Authorizer's OWN clock: the principal's realm must have a live (unrevoked, unexpired) trust
-// entry whose bound policy digest matches the identity the assertion presents — issuer,
-// audience, policy version and grammar version in one comparison (policyMatches) — the token
-// must not be expired, and its audience must be this receiver's.
+// entry whose bound policy digest matches the identity the assertion presents — realm, issuer,
+// audience and policy version in one comparison (policyMatches) — the token must not be
+// expired, and its audience must be this receiver's.
 func (a *Authorizer) trustAccepts(p VerifiedPrincipal, now int64) bool {
 	realm := p.Realm()
 	if !validRealm(realm) {

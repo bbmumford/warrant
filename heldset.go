@@ -57,10 +57,20 @@ func ParseHeldSet(held []string, realm string) (CapabilitySet, error) {
 //
 // It is whole-set over what it owns. An element naming a realm before a colon is a
 // capability and must parse; one that does not parse refuses the whole set, for the
-// reason ParseHeldSet gives. An element with no colon is the other vocabulary's and no
-// element of this set, so a judge over capabilities neither reads nor refuses it:
-// ScopesToCapabilities is what turns those into capabilities, and it widens a deny it
-// cannot express exactly rather than dropping it.
+// reason ParseHeldSet gives. An element with no colon is the dotted vocabulary's and no
+// element of this set: a judge whose realm converts that vocabulary reads it through
+// ScopeConversion, and refusing on it here would deny every caller whose grant list
+// carries both at once.
+//
+// Leaving an element out here does not make it read elsewhere. ScopesToCapabilities
+// widens a dotted deny it cannot express exactly, but it emits only widened forms
+// ParseCapability accepts, and its realm-prefix cut reads nothing spelled in capability
+// form; a realm whose grants are minted as capabilities rather than converted runs no
+// conversion over the list at all. So a deny that has to bind must be spelled as a
+// capability, where this function requires it to parse.
+//
+// MaxCapabilitiesPerSet bounds the whole list, dotted elements included, because the loop
+// walks every element whichever vocabulary it belongs to.
 //
 // A well-formed capability of another realm is left out rather than refused. A
 // principal holds capabilities of more than one realm at once, each realm's judge
