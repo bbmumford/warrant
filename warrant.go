@@ -30,8 +30,24 @@ import (
 // ErrDenied is the SINGLE non-disclosing deny. Every failure — forged/unverified seal, wrong
 // deployment, unknown operation, untrusted/expired assertion, realm mismatch, absent or
 // mismatched partition, unmet capability, replayed nonce, nil seam, malformed grammar — surfaces
-// as this, so a refusal never discloses which leg failed.
+// as this or unwraps to it (a *DeniedError), so a refusal never discloses which leg failed.
 var ErrDenied = errors.New("authorization denied")
+
+// DeniedError is Authorize's refusal of an operation its route table holds: it names the
+// capability that operation's route requires and unwraps to ErrDenied, so callers keep testing
+// errors.Is(err, ErrDenied). Authorize returns the same DeniedError for every leg that fails on
+// one operation, so its text names what the operation requires and never which leg failed.
+// cortex's handlers.Authorized prefixes the operation's name to it and the RPC bridge returns
+// that text to the caller, so a refused caller reads the capability it was judged against; the
+// operation's advert on the mesh already names the same requirement (loom's peer record
+// requirement tag), so naming it here discloses nothing a mesh peer cannot read.
+type DeniedError struct {
+	Required string // the route's required capability, in Capability.String's canonical form
+}
+
+func (e *DeniedError) Error() string { return ErrDenied.Error() + ": requires " + e.Required }
+
+func (e *DeniedError) Unwrap() error { return ErrDenied }
 
 // Re-exported from internal/mint. The types are usable by consumers; Mint (a Verifier method)
 // and the seal live in internal/mint, and the seal has no accessor, so no consumer can read
@@ -548,8 +564,34 @@ func (a *Authorizer) trustAccepts(p VerifiedPrincipal, now int64) bool {
 // server-operation route lookup; (4) sealed assertion trust + expiry against the owned clock;
 // (5) sealed capabilities parsed + partition/realm/capability binding; (6) atomic replay consume
 // LAST, only after every prior check passes, so a failed attempt cannot poison a nonce.
-// Non-disclosing: every failure is ErrDenied. bodyPartition is the op-specific partition (compare-only).
+// Non-disclosing: every failure is the one denial of op (denial), whichever check refused it.
+// bodyPartition is the op-specific partition (compare-only).
 func (a *Authorizer) Authorize(ctx context.Context, principal VerifiedPrincipal, op OperationID, bodyPartition string) (Identity, error) {
+	id, err := a.authorize(ctx, principal, op, bodyPartition)
+	if err != nil {
+		return Identity{}, a.denial(op)
+	}
+	return id, nil
+}
+
+// denial is Authorize's one refusal of op: a *DeniedError naming the capability op's route
+// requires when the route table holds op, and the bare ErrDenied for an unwired Authorizer or
+// an operation it holds no route for, which has no capability to name. It reads only the
+// immutable route table, so it depends on nothing the failed check saw.
+func (a *Authorizer) denial(op OperationID) error {
+	if a == nil {
+		return ErrDenied
+	}
+	route, ok := a.routes[op]
+	if !ok {
+		return ErrDenied
+	}
+	return &DeniedError{Required: route.required.String()}
+}
+
+// authorize runs Authorize's checks in the order its doc gives and returns ErrDenied from the
+// first that fails; Authorize turns that into op's one denial.
+func (a *Authorizer) authorize(ctx context.Context, principal VerifiedPrincipal, op OperationID, bodyPartition string) (Identity, error) {
 	_ = ctx
 	// nil-seam fail-closed.
 	if a == nil || a.verifier == nil || a.replay == nil || a.mono == nil {
