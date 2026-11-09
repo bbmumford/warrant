@@ -19,11 +19,11 @@ package warrant
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/bbmumford/loom/pkg/rpc/scope"
 	"github.com/bbmumford/warrant/internal/mint"
 )
 
@@ -31,7 +31,21 @@ import (
 // deployment, unknown operation, untrusted/expired assertion, realm mismatch, absent or
 // mismatched partition, unmet capability, replayed nonce, nil seam, malformed grammar — surfaces
 // as this or unwraps to it (a *DeniedError), so a refusal never discloses which leg failed.
-var ErrDenied = errors.New("authorization denied")
+//
+// It unwraps to loom's scope.ErrDenied, so a denial a handler returns is a refusal of the
+// caller's authority wherever loom carries it: loom's registry reports it as the handler's
+// denial, dispatch.StampDenial stamps it on a response crossing the mesh, and the RPC HTTP
+// bridge answers it 403 in its own process and through a proxy (classifyHandlerStatus,
+// classifyMeshError), which read no other error as a refusal of the caller. The status is then
+// one for every leg, as the text is.
+var ErrDenied error = denial{}
+
+// denial is ErrDenied's type: its text, and the scope.ErrDenied it unwraps to.
+type denial struct{}
+
+func (denial) Error() string { return "authorization denied" }
+
+func (denial) Unwrap() error { return scope.ErrDenied }
 
 // DeniedError is Authorize's refusal of an operation its route table holds: it names the
 // capability that operation's route requires and unwraps to ErrDenied, so callers keep testing
