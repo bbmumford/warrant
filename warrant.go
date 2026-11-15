@@ -115,20 +115,30 @@ func validSegment(s string, allowWildcard bool) bool {
 
 func validPartition(s string) bool { return validSegment(s, false) }
 
-// Capability is realm-namespaced: "<realm>:<resource>.<action>". A leading "-" makes it a
+// Capability is realm-namespaced: "<realm>:<resource>.<action>", optionally followed by one
+// parameter in parentheses, "<realm>:<resource>.<action>(<parameter>)". A leading "-" makes it a
 // NEGATIVE capability — a deny that overrides any positive match in the same set (see
 // CapabilitySet.Allows). Unexported fields; only ParseCapability mints a valid one.
 //
 // A terminal "*" action covers every action on the resource. The RESOURCE may also be "*",
 // but only on a revocation: "-<realm>:*.*" refuses a whole realm, which a positive
 // capability deliberately cannot express.
+//
+// The parameter names the one instance of an action a grant reaches, such as the class an
+// approver may approve ("orbtr:exec.approve(fs_delete)") or the mode a subject may run as
+// ("orbtr:exec.run_as(elevated)"), so a role can hold an action for one instance without the
+// rest. A capability with no parameter covers its action for every parameter, a deny included,
+// so "-orbtr:exec.approve" revokes every class; one with a parameter covers that parameter only.
+// A "*" action takes no parameter.
 type Capability struct {
-	realm, resource, action string
-	deny                    bool
+	realm, resource, action, param string
+	deny                           bool
 }
 
 // ParseCapability parses "<realm>:<resource>.<action>", or "-<realm>:<resource>.<action>" for a
-// negative capability.
+// negative capability, each optionally ending in one "(<parameter>)". The parameter is one token
+// of the resource alphabet; an empty, unclosed or nested parameter, a parameter on a "*" action
+// and anything after the closing parenthesis are refused.
 //
 // The leading "-" MUST be stripped before validation rather than left on the realm: validSegment
 // admits "-" as an ordinary character, so "-orbtr:exec.run_as" would otherwise parse as a
@@ -151,10 +161,18 @@ func ParseCapability(s string) (Capability, error) {
 	// grant anything, whereas a positive "<realm>:*.<action>" would confer a whole realm
 	// in one token and is refused. This is what lets a realm-wide revocation be exact
 	// instead of only as complete as the caller's resource vocabulary.
+	param := ""
+	if open := strings.IndexByte(action, '('); open >= 0 {
+		inner, closed := strings.CutSuffix(action[open+1:], ")")
+		if !closed || action[:open] == "*" || !validSegment(inner, false) {
+			return Capability{}, ErrDenied
+		}
+		action, param = action[:open], inner
+	}
 	if !validRealm(realm) || !validSegment(resource, deny) || !validSegment(action, true) {
 		return Capability{}, ErrDenied
 	}
-	return Capability{realm: realm, resource: resource, action: action, deny: deny}, nil
+	return Capability{realm: realm, resource: resource, action: action, param: param, deny: deny}, nil
 }
 
 func (c Capability) Realm() string { return c.realm }
@@ -163,8 +181,12 @@ func (c Capability) IsZero() bool  { return c.realm == "" }
 // IsDeny reports whether c is a negative capability (a revocation).
 func (c Capability) IsDeny() bool { return c.deny }
 
+// Param returns c's parameter, or "" when c covers its action for every parameter.
+func (c Capability) Param() string { return c.param }
+
 // String renders the canonical form ParseCapability accepts — "<realm>:<resource>.<action>",
-// prefixed "-" for a negative capability — so ParseCapability(c.String()) reproduces c for every
+// followed by "(<parameter>)" when c carries one and prefixed "-" for a negative capability — so
+// ParseCapability(c.String()) reproduces c for every
 // capability ParseCapability can mint. That round trip is what lets a set cross a []string
 // boundary, such as a mint input, without losing what it holds.
 //
@@ -181,6 +203,9 @@ func (c Capability) String() string {
 		return ""
 	}
 	s := c.realm + ":" + c.resource + "." + c.action
+	if c.param != "" {
+		s += "(" + c.param + ")"
+	}
 	if c.deny {
 		s = "-" + s
 	}
@@ -188,12 +213,17 @@ func (c Capability) String() string {
 }
 
 // covers reports whether c's realm/resource/action pattern matches required, treating a terminal
-// "*" action as covering any action in the same realm+resource. It ignores the deny flag on both
-// sides: callers decide what a match MEANS.
+// "*" action as covering any action in the same realm+resource, and c with no parameter as covering
+// its action for every parameter; c with a parameter covers required only when required names the
+// same one, so a request with no parameter, which asks for the action for every parameter, is not
+// covered by a grant of one. It ignores the deny flag on both sides: callers decide what a match
+// MEANS. Allows tests it in both directions for a deny, which is what makes a parameterless deny
+// refuse every parameter and a deny of one parameter refuse a request for all of them.
 func (c Capability) covers(required Capability) bool {
 	return c.realm == required.realm &&
 		(c.resource == required.resource || c.resource == "*") &&
-		(c.action == required.action || c.action == "*")
+		(c.action == required.action || c.action == "*") &&
+		(c.param == "" || c.param == required.param)
 }
 
 // CapabilitySet — same-realm subsumption only; a terminal "*" action subsumes any action in

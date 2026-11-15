@@ -207,7 +207,9 @@ func (c ScopeConversion) everyResource(action string) []string {
 }
 
 // split trims the realm and requires the remainder to be exactly
-// <resource>.<action>.
+// <resource>.<action>. The action may end in a parenthesised parameter
+// ("orbtr.exec.approve(fs_delete)"); it carries through into the emitted
+// capability, which ParseCapability reads.
 func (c ScopeConversion) split(scope string) (resource, action string, ok bool) {
 	rest, ok := strings.CutPrefix(scope, c.Realm+".")
 	if !ok {
