@@ -48,6 +48,18 @@ type ScopeConversion struct {
 	// Reserved constrains GRANTS only. A deny naming a reserved resource is
 	// still emitted: withholding it could only ever widen access.
 	Reserved map[string]struct{}
+
+	// ActionWildcards narrows an action-wildcard grant on the resources it lists:
+	// "<realm>.<resource>.*", and a realm-wide grant reaching a listed known
+	// resource, convert to one capability per action named here instead of
+	// "<resource>.*". A resource that keeps some actions out of every
+	// wildcard (a family's held-back verbs) lists only the others, so an action
+	// wildcard, whose "*" covers every action and parameter, never confers one
+	// of those.
+	//
+	// It constrains GRANTS only: a deny of "<resource>.*" keeps its wildcard,
+	// because withholding more can only narrow access.
+	ActionWildcards map[string][]string
 }
 
 // ScopesToCapabilities converts held RBAC scope strings into the capabilities
@@ -132,6 +144,15 @@ func (c ScopeConversion) expand(scope string) []string {
 	if _, reserved := c.Reserved[resource]; reserved {
 		return nil
 	}
+	if action == "*" {
+		if actions, narrowed := c.ActionWildcards[resource]; narrowed {
+			out := make([]string, 0, len(actions))
+			for _, a := range actions {
+				out = append(out, c.outRealm()+":"+resource+"."+a)
+			}
+			return out
+		}
+	}
 	// action may be "*" — that IS expressible, as an action-wildcard capability.
 	return []string{c.outRealm() + ":" + resource + "." + action}
 }
@@ -199,6 +220,12 @@ func (c ScopeConversion) everyResource(action string) []string {
 	out := make([]string, 0, len(c.KnownResources))
 	for _, r := range c.KnownResources {
 		if _, reserved := c.Reserved[r]; reserved {
+			continue
+		}
+		if actions, narrowed := c.ActionWildcards[r]; narrowed && action == "*" {
+			for _, a := range actions {
+				out = append(out, c.outRealm()+":"+r+"."+a)
+			}
 			continue
 		}
 		out = append(out, c.outRealm()+":"+r+"."+action)
