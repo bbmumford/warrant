@@ -41,7 +41,9 @@ func TestEveryDenialIsALoomScopeDenialAndReadsAsBefore(t *testing.T) {
 	if got := named.Error(); got != "authorization denied: requires orbtr.ai:assistants.read" {
 		t.Errorf("DeniedError reads %q", got)
 	}
-	if errors.Is(scope.ErrDenied, ErrDenied) {
+	// A loom scope refusal as a caller meets it, wrapped once.
+	scopeRefusal := fmt.Errorf("loom: %w", scope.ErrDenied)
+	if errors.Is(scopeRefusal, ErrDenied) {
 		t.Errorf("scope.ErrDenied unwraps to ErrDenied: a loom scope refusal is not a warrant denial")
 	}
 }
