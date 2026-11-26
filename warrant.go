@@ -143,14 +143,16 @@ type Capability struct {
 // The leading "-" MUST be stripped before validation rather than left on the realm: validSegment
 // admits "-" as an ordinary character, so "-orbtr:exec.run_as" would otherwise parse as a
 // capability in a realm literally named "-orbtr" — which matches nothing and therefore denies
-// nothing, silently turning a revocation into a no-op.
+// nothing, silently turning a revocation into a no-op. For the same reason a realm may not begin
+// with "-" at all, so "--orbtr:exec.run_as", which strips to the realm "-orbtr", is refused rather
+// than read as a deny that revokes nothing.
 func ParseCapability(s string) (Capability, error) {
 	deny := strings.HasPrefix(s, "-")
 	if deny {
 		s = s[1:]
 	}
 	realm, rest, ok := strings.Cut(s, ":")
-	if !ok {
+	if !ok || strings.HasPrefix(realm, "-") {
 		return Capability{}, ErrDenied
 	}
 	resource, action, ok := strings.Cut(rest, ".")
