@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// TestVerifierFmtRedactsKey (R-2422 (1)): formatting the Verifier discloses no key bytes.
+// TestVerifierFmtRedactsKey: formatting the Verifier discloses no key bytes.
 func TestVerifierFmtRedactsKey(t *testing.T) {
 	v, _ := NewVerifier()
 	dump := fmt.Sprintf("%#v|%+v|%v", v, v, v)
@@ -28,7 +28,7 @@ func sample() Assertion {
 	}
 }
 
-// TestPrincipalDoesNotEmbedKey is the assurance HOLD-3 proof: the receiver key never enters a
+// TestPrincipalDoesNotEmbedKey proves the receiver key never enters a
 // principal, so reflecting/logging one (fmt %#v/%+v/%v) discloses no key material.
 func TestPrincipalDoesNotEmbedKey(t *testing.T) {
 	v, err := NewVerifier()

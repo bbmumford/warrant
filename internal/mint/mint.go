@@ -1,4 +1,4 @@
-// Package mint is the receiver-pinned seal root of warrant (plan §16.1). Authenticity is a MAC,
+// Package mint is the receiver-pinned seal root of warrant. Authenticity is a MAC,
 // not a copied secret: a Verifier holds a per-instance HMAC key (crypto/rand), Mint stamps the
 // principal with a TAG = HMAC(key, canonical(assertion)), and Verify recomputes the tag with the
 // key and compares it in constant time. The KEY NEVER ENTERS A PRINCIPAL — a principal carries
@@ -123,7 +123,7 @@ func (v *Verifier) Mint(a Assertion) (VerifiedPrincipal, error) {
 }
 
 // GoString and String redact the key on the VALUE receiver (so both Verifier and *Verifier, and a
-// dereferenced copy, redact) — ordinary formatting/logging discloses no minting material (R-2422 (1)).
+// dereferenced copy, redact) — ordinary formatting/logging discloses no minting material.
 func (v Verifier) GoString() string { return "mint.Verifier{key:(redacted)}" }
 func (v Verifier) String() string   { return "mint.Verifier{redacted}" }
 

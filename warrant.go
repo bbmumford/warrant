@@ -1,9 +1,9 @@
-// Package warrant is the scope-agnostic, receiver-pinned authority core for the ORBTR
-// platform retirement (plan §16.1). Like loom it interprets NO axis itself; but the CORE —
+// Package warrant is the scope-agnostic, receiver-pinned authority core. Like loom it
+// interprets NO axis itself; but the CORE —
 // never a consumer — enforces every authority invariant, and authority is RECEIVER-
 // VERIFIABLE at runtime, independent of caller-selected import path.
 //
-// The model (R-2407/R-2411): a trusted host builds ONE Verifier (a per-instance secret from
+// The model: a trusted host builds ONE Verifier (a per-instance secret from
 // crypto/rand) at boot and shares it between its authentication edge (which Mints principals
 // from real auth) and its Authorizer (which Verifies). A forger — even a nested-path module
 // that imports internal/mint — can mint, but stamps its OWN secret, and the real Authorizer
@@ -241,8 +241,8 @@ func NewCapabilitySet(held ...Capability) CapabilitySet { return CapabilitySet{h
 // revocations (e.g. {"orbtr:exec.*", "-orbtr:exec.run_as", "-orbtr:exec.mode"}) can only
 // express the revocation if the deny outranks the wildcard that confers it.
 //
-// A set holding no negative capability behaves exactly as it did before deny existed: the deny
-// scan matches nothing and the positive scan decides.
+// For a set holding no negative capability the deny scan matches nothing and the positive scan
+// alone decides.
 //
 // The deny scan tests coverage in BOTH directions, because a request can be broader than the
 // revocation that spoils it. Asking for a terminal "*" asks for every action on the resource,
@@ -308,7 +308,7 @@ func (o Partition) IsZero() bool { return o.realm == "" || o.id == "" }
 func (o Partition) Equal(x Partition) bool { return o.realm == x.realm && o.id == x.id }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Route — closed sum, keyed by SERVER operation identity (R-2411 pin 2). The Authorizer
+// Route — closed sum, keyed by SERVER operation identity. The Authorizer
 // holds an immutable route table; a caller supplies only the operation being invoked (set
 // server-side by the RPC dispatch), never a substituted weaker route.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,7 +348,7 @@ func GlobalRoute(op OperationID, required Capability) (Route, error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Receiver-pinned trust (R-2411 pins 1/3). RealmTrust entries are owner-ratified, validated
+// Receiver-pinned trust. RealmTrust entries are owner-ratified, validated
 // at construction, and consumed by the Authorizer's own clock — never a caller interface.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -373,12 +373,12 @@ func (rt RealmTrust) valid() bool {
 }
 
 // Clock returns the current time in unix-milliseconds. The Authorizer owns one; Authorize
-// accepts no caller-supplied time (R-2411 pin 3).
+// accepts no caller-supplied time, so a caller cannot move a decision's instant.
 type Clock func() int64
 
 const (
 	// maxPrincipalTTLms caps how far in the future an assertion may expire — bounds how long a
-	// consumed nonce must be retained for replay defense (R-2422 (3) long-horizon).
+	// consumed nonce must be retained for replay defense.
 	maxPrincipalTTLms = int64(24 * 60 * 60 * 1000) // 24h
 	// maxReplayEntries caps live consumed-nonce storage; at capacity, consume FAILS CLOSED rather
 	// than evicting an unexpired entry to admit reuse. Past half of it the store admits a subject's
@@ -389,7 +389,7 @@ const (
 
 // monoClock wraps a Clock with a monotonic high-water mark: a rolled-back wall clock never yields
 // a time earlier than one already observed, so an expired/evicted principal cannot resurrect and
-// a consumed nonce cannot be un-expired (R-2422 (3) rollback-safe).
+// a consumed nonce cannot be un-expired.
 type monoClock struct {
 	mu    sync.Mutex
 	clock Clock
@@ -405,7 +405,7 @@ func (m *monoClock) now() int64 {
 	return m.hw
 }
 
-// A request principal MUST carry a non-empty, bounded replay nonce (assurance HOLD 2): replay is
+// A request principal MUST carry a non-empty, bounded replay nonce: replay is
 // never caller-optional. Bounds reject an empty or oversize nonce.
 const (
 	minNonceLen = 8
@@ -568,7 +568,7 @@ type Authorizer struct {
 }
 
 // GoString and String redact the handler-facing Authorizer: it holds the Verifier (and thus the
-// minting key), so ordinary formatting/logging must never expand it into its fields (R-2422 (1)).
+// minting key), so ordinary formatting/logging must never expand it into its fields.
 func (a *Authorizer) GoString() string { return "warrant.Authorizer{redacted: holds Verifier key}" }
 func (a *Authorizer) String() string   { return "warrant.Authorizer{redacted}" }
 
@@ -626,7 +626,7 @@ func (a *Authorizer) trustAccepts(p VerifiedPrincipal, now int64) bool {
 	if e.Revoked || e.ExpiresAtMS <= now {
 		return false
 	}
-	// expired, no-expiry, OR a TTL beyond the cap (bounds replay-map retention; R-2422 (3)).
+	// expired, no-expiry, OR a TTL beyond the cap (bounds replay-map retention).
 	if p.ExpiresAtMS() <= 0 || now >= p.ExpiresAtMS() || p.ExpiresAtMS() > now+maxPrincipalTTLms {
 		return false
 	}
@@ -682,11 +682,11 @@ func (a *Authorizer) authorize(ctx context.Context, principal VerifiedPrincipal,
 	if principal.Subject().ID == "" || principal.Subject().Kind == "" || principal.Deployment() != a.expectedDeployment {
 		return Identity{}, ErrDenied
 	}
-	// (2a) representation consistency — HasPartition must agree with Partition presence (assurance HOLD 4).
+	// (2a) representation consistency — HasPartition must agree with Partition presence.
 	if principal.HasPartition() != (principal.Partition() != "") {
 		return Identity{}, ErrDenied
 	}
-	// (2b) MANDATORY bounded replay nonce — replay is never caller-optional (assurance HOLD 2).
+	// (2b) MANDATORY bounded replay nonce — replay is never caller-optional.
 	if n := principal.Nonce(); len(n) < minNonceLen || len(n) > maxNonceLen {
 		return Identity{}, ErrDenied
 	}
@@ -695,13 +695,13 @@ func (a *Authorizer) authorize(ctx context.Context, principal VerifiedPrincipal,
 	if !ok {
 		return Identity{}, ErrDenied
 	}
-	// (3a) REALM BINDING — the principal's realm must equal the route's realm (assurance HOLD 1);
+	// (3a) REALM BINDING — the principal's realm must equal the route's realm;
 	// a foreign-realm assertion cannot authorize a home route even carrying a home-realm capability.
 	if principal.Realm() != route.required.Realm() {
 		return Identity{}, ErrDenied
 	}
 	// (4) sealed capabilities parsed here (never caller-authored) as ONE set: a malformed element, a
-	// cross-realm element (assurance HOLD 1) or a set past MaxCapabilitiesPerSet denies the whole set
+	// cross-realm element or a set past MaxCapabilitiesPerSet denies the whole set
 	// rather than part of it (ParseHeldSet). This and the partition/global binding below are
 	// DETERMINISTIC (no clock), so they run BEFORE the single time sample: a malformed/unmet-capability
 	// or wrong-partition denial reads the clock ZERO times, and only a decision that has passed EVERY
@@ -724,7 +724,7 @@ func (a *Authorizer) authorize(ctx context.Context, principal VerifiedPrincipal,
 		}
 		id.Partition = os
 	case modeGlobal:
-		// global routes deny ANY partition material (assurance HOLD 4).
+		// global routes deny ANY partition material.
 		if principal.HasPartition() || principal.Partition() != "" || bodyPartition != "" {
 			return Identity{}, ErrDenied
 		}

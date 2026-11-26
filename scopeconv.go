@@ -21,7 +21,7 @@ type ScopeConversion struct {
 
 	// OutRealm is the realm emitted capabilities carry, when it differs from the
 	// realm scopes are read at. Empty means Realm, so a conversion that reads and
-	// emits in one realm sets only Realm and behaves exactly as before.
+	// emits in one realm sets only Realm.
 	//
 	// The two separate because the input realm says which scopes this conversion
 	// is willing to read, while the output realm is what a capability reader
@@ -287,7 +287,7 @@ func (c ScopeConversion) split(scope string) (resource, action string, ok bool) 
 
 // outRealm is the realm capabilities are emitted into: OutRealm when set,
 // otherwise Realm. Defaulting here rather than at each construction is what lets
-// a conversion that never sets it keep behaving exactly as it did.
+// a conversion that never sets it read and emit in the one realm.
 func (c ScopeConversion) outRealm() string {
 	if c.OutRealm != "" {
 		return c.OutRealm

@@ -163,7 +163,7 @@ func TestTrust_IssuerAudienceVersionExpiry(t *testing.T) {
 	}
 }
 
-// TestRealmBinding_ForeignRealmHomeCapDenied is the exact assurance HOLD-1 bug: a TRUSTED foreign
+// TestRealmBinding_ForeignRealmHomeCapDenied is the realm-binding case: a TRUSTED foreign
 // realm carrying a HOME-realm capability must NOT authorize the home route.
 func TestRealmBinding_ForeignRealmHomeCapDenied(t *testing.T) {
 	v, _ := NewVerifier()
@@ -198,7 +198,7 @@ func TestPartitionBound_PartitionMismatch_Denied(t *testing.T) {
 }
 
 // TestRepresentationConsistency_MintRejects: HasPartition must equal Partition-presence, enforced AT MINT
-// (assurance HOLD 4 / R-2422 (4)) — an inconsistent bundle can never be sealed.
+// — an inconsistent bundle can never be sealed.
 func TestRepresentationConsistency_MintRejects(t *testing.T) {
 	v, _ := NewVerifier()
 	as := baseAssertion()
@@ -365,7 +365,7 @@ func TestParseCapability_Malformed(t *testing.T) {
 	}
 }
 
-// TestReplayStore_CapacityFailClosed (R-2422 (3)): at capacity the store denies rather than
+// TestReplayStore_CapacityFailClosed: at capacity the store denies rather than
 // evicting an unexpired entry to admit reuse; an expired entry is evicted to free space.
 func TestReplayStore_CapacityFailClosed(t *testing.T) {
 	r := &replayStore{consumed: map[replayKey]int64{}, maxEntries: 2}
@@ -382,7 +382,7 @@ func TestReplayStore_CapacityFailClosed(t *testing.T) {
 	}
 }
 
-// TestMonoClock_RollbackSafe (R-2422 (3)): a rolled-back wall clock never yields a lower time,
+// TestMonoClock_RollbackSafe: a rolled-back wall clock never yields a lower time,
 // so a consumed/expired principal cannot resurrect.
 func TestMonoClock_RollbackSafe(t *testing.T) {
 	cur := int64(1000)
@@ -400,7 +400,7 @@ func TestMonoClock_RollbackSafe(t *testing.T) {
 	}
 }
 
-// TestLongHorizonTTL_Denied (R-2422 (3)): a principal whose expiry exceeds the TTL cap is denied,
+// TestLongHorizonTTL_Denied: a principal whose expiry exceeds the TTL cap is denied,
 // bounding how long a consumed nonce must be retained.
 func TestLongHorizonTTL_Denied(t *testing.T) {
 	v, _ := NewVerifier()
@@ -413,7 +413,7 @@ func TestLongHorizonTTL_Denied(t *testing.T) {
 	}
 }
 
-// TestAuthorizerFmtRedactsKey (R-2422 (1)): formatting the handler-facing Authorizer (which holds
+// TestAuthorizerFmtRedactsKey: formatting the handler-facing Authorizer (which holds
 // the Verifier) redacts the key — no minting material leaks through ordinary logging.
 func TestAuthorizerFmtRedactsKey(t *testing.T) {
 	v, _ := NewVerifier()
@@ -518,7 +518,7 @@ func TestC2_LargeLiveSetDoesNotEvictUnexpired(t *testing.T) {
 	}
 }
 
-// TestC1_DeterministicDenialsReadClockZeroTimes (R-2426 C1 placement): every deterministic authority
+// TestC1_DeterministicDenialsReadClockZeroTimes: every deterministic authority
 // denial — malformed/unmet/cross-realm capability, wrong owner, global owner-material — is decided
 // BEFORE the single time sample, so it reads the clock ZERO times; only a decision that has passed
 // every deterministic check reaches the clock, and a valid one reads it EXACTLY once. A counting
@@ -562,7 +562,7 @@ func TestC1_DeterministicDenialsReadClockZeroTimes(t *testing.T) {
 	}
 }
 
-// TestC2_EvictionInspectionsIndependentOfLiveSet (R-2426 C2 proof): the operation-count witness. A
+// TestC2_EvictionInspectionsIndependentOfLiveSet: the operation-count witness. A
 // consume with nothing expired inspects only the heap root — ONE inspection — regardless of live-set
 // size. A regression to a full live-map range would make the count scale with N; length-only
 // assertions could not tell the difference.
@@ -770,11 +770,11 @@ func (r *replayStore) consume() { var live replayIndex = r.consumed; live.scan()
 		t.Fatal("[bypass] could not locate the warrant.go fixture file")
 	}
 	if n := c2bRangeOnly(bfset, warrantFile, binfo, bfield.Type().Underlying()); n != 0 {
-		t.Fatalf("[bypass] old single-file range-only guard must be GREEN on warrant.go (the gap R-2435 proved); got %d range violations", n)
+		t.Fatalf("[bypass] old single-file range-only guard must be GREEN on warrant.go (it cannot see a cross-file range); got %d range violations", n)
 	}
 	// successor guard over BOTH files: RED (it flags the alias site AND the cross-file range).
 	if bv, _, _, _ := c2bAnalyze(bfset, bfiles, binfo, bfield); len(bv) == 0 {
-		t.Fatal("[bypass] successor guard must be RED on the R-2435 cross-file bypass")
+		t.Fatal("[bypass] successor guard must be RED on the cross-file bypass")
 	}
 }
 

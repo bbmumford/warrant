@@ -26,8 +26,9 @@ import (
 // It exists because an authored grant and a minted one are different acts with
 // different trust. Mint is performed by the edge from a completed
 // authentication, so what it seals is already server-established. An authored
-// grant is a stored list somebody wrote, and the writer may be a tenant: roles
-// are an open set, so a tenant-authored role can name any capability it likes.
+// grant is a stored list somebody wrote, and the writer may be a partition's own
+// administrator: roles are an open set, so a role authored there can name any
+// capability it likes.
 // Grant is the seam where that list stops being text and becomes authority, and
 // it is the only place a reserved family can be refused before it is conferred.
 type GrantPolicy struct {

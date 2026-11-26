@@ -108,7 +108,7 @@ func main() {
 }
 `
 
-// TestNestedModule_ForgedPrincipal_DeniedByRealAuthorizer is the durable R-2411 pin-5 proof:
+// TestNestedModule_ForgedPrincipal_DeniedByRealAuthorizer proves the receiver pin end to end:
 // it builds a real nested-path module that imports internal/mint, mints a forged principal,
 // and asserts the REAL host Authorizer denies it. The adversary module is generated at test
 // time, so no separate committed module is needed.
