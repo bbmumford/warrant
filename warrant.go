@@ -381,7 +381,9 @@ const (
 	// consumed nonce must be retained for replay defense (R-2422 (3) long-horizon).
 	maxPrincipalTTLms = int64(24 * 60 * 60 * 1000) // 24h
 	// maxReplayEntries caps live consumed-nonce storage; at capacity, consume FAILS CLOSED rather
-	// than evicting an unexpired entry to admit reuse (R-2422 (3) capacity).
+	// than evicting an unexpired entry to admit reuse. Past half of it the store admits a subject's
+	// nonce only while that subject holds fewer live entries than the mean per subject (consumeFor),
+	// so one subject's traffic cannot fill the store and refuse every other subject.
 	maxReplayEntries = 1 << 20
 )
 
@@ -439,6 +441,10 @@ type replayStore struct {
 	// test can prove eviction never ranges over all live entries (a regression to a full-map scan
 	// would make it O(live)). Not part of the authority decision.
 	evictInspections int64
+	// owner is the subject each live entry was consumed for, and held how many live entries each
+	// subject holds; both change only with consumed, so held's counts sum to len(consumed).
+	owner map[replayKey]string
+	held  map[string]int
 }
 
 func newReplayStore() *replayStore {
@@ -451,8 +457,21 @@ func newReplayStore() *replayStore {
 // outward), then enforces exactly-once and a fail-closed capacity that never evicts an UNEXPIRED entry
 // to admit reuse.
 func (r *replayStore) consume(key replayKey, expiryMS, nowMS int64) bool {
+	return r.consumeFor(key, "", expiryMS, nowMS)
+}
+
+// consumeFor is consume for a nonce subject presents. Once the store holds at least half of
+// maxEntries live entries it refuses a subject that already holds at least the mean number of live
+// entries per subject holding any, so a subject driving more traffic than its share runs into its
+// own refusals while every other subject, a new one included, is still admitted. The mean cannot be
+// pushed down by the subject being refused, so its share is bounded by the others' use. At
+// maxEntries the store refuses every new nonce, as consume does.
+func (r *replayStore) consumeFor(key replayKey, subject string, expiryMS, nowMS int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.owner == nil {
+		r.owner, r.held = map[replayKey]string{}, map[string]int{}
+	}
 	for len(r.heap) > 0 {
 		r.evictInspections++ // inspect the root only; O(expired)+1 per consume, never O(live)
 		if r.heap[0].expiry > nowMS {
@@ -462,15 +481,27 @@ func (r *replayStore) consume(key replayKey, expiryMS, nowMS int64) bool {
 		// Lazy 1:1 delete: drop the map entry only for the same insertion this heap node recorded.
 		if cur, ok := r.consumed[e.key]; ok && cur == e.expiry {
 			delete(r.consumed, e.key)
+			if who, ok := r.owner[e.key]; ok {
+				delete(r.owner, e.key)
+				if r.held[who]--; r.held[who] <= 0 {
+					delete(r.held, who)
+				}
+			}
 		}
 	}
 	if _, used := r.consumed[key]; used {
 		return false
 	}
-	if len(r.consumed) >= r.maxEntries {
+	live := len(r.consumed)
+	if live >= r.maxEntries {
 		return false // fail-closed at capacity; never evict an UNEXPIRED entry to admit reuse
 	}
+	if h := r.held[subject]; h > 0 && 2*live >= r.maxEntries && h*len(r.held) >= live {
+		return false // past half capacity: this subject holds at least the mean share
+	}
 	r.consumed[key] = expiryMS
+	r.owner[key] = subject
+	r.held[subject]++
 	r.heapPush(replayEntry{key: key, expiry: expiryMS})
 	return true
 }
@@ -717,7 +748,8 @@ func (a *Authorizer) authorize(ctx context.Context, principal VerifiedPrincipal,
 	// never poisons the nonce; the nonce is mandatory (2b) so every request is exactly-once, and two
 	// concurrent identical uses yield exactly one success. Typed key, expiry-bounded storage.
 	key := replayKey{principal.Issuer(), principal.Audience(), principal.Version(), principal.Realm(), principal.Nonce()}
-	if !a.replay.consume(key, principal.ExpiresAtMS(), nowMS) {
+	subject := string(principal.Subject().Kind) + "\x00" + principal.Subject().ID
+	if !a.replay.consumeFor(key, subject, principal.ExpiresAtMS(), nowMS) {
 		return Identity{}, ErrDenied
 	}
 	return id, nil

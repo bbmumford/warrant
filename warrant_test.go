@@ -370,14 +370,14 @@ func TestParseCapability_Malformed(t *testing.T) {
 func TestReplayStore_CapacityFailClosed(t *testing.T) {
 	r := &replayStore{consumed: map[replayKey]int64{}, maxEntries: 2}
 	k := func(n string) replayKey { return replayKey{issuer, aud, ver, homeRealm, n} }
-	if !r.consume(k("a"), 100, 10) || !r.consume(k("b"), 100, 10) {
+	if !r.consumeFor(k("a"), "s1", 100, 10) || !r.consumeFor(k("b"), "s2", 100, 10) {
 		t.Fatal("first two unexpired entries must admit")
 	}
-	if r.consume(k("c"), 100, 10) {
+	if r.consumeFor(k("c"), "s3", 100, 10) {
 		t.Fatal("at capacity with all entries unexpired, a new entry must FAIL CLOSED (no evict-to-admit)")
 	}
 	// advance the clock past expiry: the expired entries evict, freeing capacity.
-	if !r.consume(k("d"), 500, 200) {
+	if !r.consumeFor(k("d"), "s1", 500, 200) {
 		t.Fatal("once entries expire, a fresh nonce admits")
 	}
 }
