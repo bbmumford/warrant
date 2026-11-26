@@ -25,6 +25,11 @@ import "strings"
 // behaviour is right; what is missing is the ability to ask. A realm rename uses
 // this to assert its own work: convert the stored denies under the new realm and
 // require the result to be empty before the rename is called done.
+//
+// It also reports each deny ScopesToCapabilities could keep only by widening it past its own
+// spelling (parseableDeny): a scope such as "-orbtr.exec.approve(fs.delete)" or "-orbtr.Exec.approve"
+// still revokes, but more than it names, and only correcting the stored scope makes it revoke what
+// it says.
 func (c ScopeConversion) OrphanedDenies(scopes []string) []string {
 	var orphaned []string
 	for _, s := range scopes {
@@ -32,7 +37,14 @@ func (c ScopeConversion) OrphanedDenies(scopes []string) []string {
 		if !isDeny {
 			continue
 		}
-		if len(c.expandDeny(rest)) == 0 {
+		caps := c.expandDeny(rest)
+		report := len(caps) == 0
+		for _, cap := range caps {
+			if _, widened, _ := c.parseableDeny(cap); widened {
+				report = true
+			}
+		}
+		if report {
 			orphaned = append(orphaned, s)
 		}
 	}

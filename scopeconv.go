@@ -87,7 +87,12 @@ type ScopeConversion struct {
 //     expressed, never dropped. A per-instance revocation
 //     "-<realm>.exec.run_as.system" has no capability-grammar form, so it is
 //     emitted as a deny of "exec.run_as" entirely; a deny naming no single
-//     resource is emitted against every KnownResources entry.
+//     resource is emitted against every resource. A deny whose own spelling
+//     the grammar refuses is widened the same way (parseableDeny): a parameter
+//     it cannot read, such as "approve(fs.delete)", is dropped so the deny
+//     covers every parameter of its action, and a resource or action it cannot
+//     read, such as an upper-case "Exec", becomes "*". OrphanedDenies reports
+//     every deny widened for its spelling, so the stored scope can be corrected.
 //
 // So both directions fail toward less access. That also decides where the
 // failure shows up: an over-broad deny breaks a legitimate call and fails a
@@ -112,7 +117,9 @@ func (c ScopeConversion) ScopesToCapabilities(scopes []string) []Capability {
 	for _, s := range scopes {
 		if rest, isDeny := strings.CutPrefix(s, "-"); isDeny {
 			for _, cap := range c.expandDeny(rest) {
-				add("-" + cap)
+				if deny, _, ok := c.parseableDeny(cap); ok {
+					add(deny)
+				}
 			}
 			continue
 		}
@@ -209,6 +216,35 @@ func (c ScopeConversion) expandDeny(scope string) []string {
 		return []string{c.outRealm() + ":*." + action}
 	}
 	return []string{c.outRealm() + ":" + resource + "." + action}
+}
+
+// parseableDeny is the deny ScopesToCapabilities emits for one of expandDeny's capability strings,
+// "-" + cap when ParseCapability reads that, else cap widened until it reads: its parameter
+// dropped, then a resource the grammar refuses made "*", then an action it refuses made "*", and
+// finally every resource and action of the realm. widened reports that cap itself did not read. ok
+// is false only when not even the realm-wide deny reads, which means the conversion's realm is one
+// no capability can name, so it grants nothing either.
+func (c ScopeConversion) parseableDeny(cap string) (deny string, widened, ok bool) {
+	if _, err := ParseCapability("-" + cap); err == nil {
+		return "-" + cap, false, true
+	}
+	realm, rest, _ := strings.Cut(cap, ":")
+	resource, action, _ := strings.Cut(rest, ".")
+	if open := strings.IndexByte(action, '('); open >= 0 {
+		action = action[:open]
+	}
+	if !validSegment(resource, true) {
+		resource = "*"
+	}
+	if !validSegment(action, true) {
+		action = "*"
+	}
+	for _, try := range []string{realm + ":" + resource + "." + action, c.outRealm() + ":*.*"} {
+		if _, err := ParseCapability("-" + try); err == nil {
+			return "-" + try, true, true
+		}
+	}
+	return "", true, false
 }
 
 // everyResource emits one grant per known resource at the given action, skipping
